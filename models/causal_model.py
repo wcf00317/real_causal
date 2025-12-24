@@ -128,7 +128,6 @@ class TaskHead(nn.Module):
 # ==============================================================================
 # 3. 主模型 (CausalMTLModel)
 # ==============================================================================
-
 class CausalMTLModel(nn.Module):
     def __init__(self, model_config, data_config):
         super().__init__()
@@ -210,6 +209,65 @@ class CausalMTLModel(nn.Module):
         last_feat = features[-1]
         h = last_feat.mean(dim=[2, 3])
         return combined_feat, h, features, raw_features
+
+    # ======================================================
+    # [NEW] CFA 核心组件：生成反事实图像 + 诊断信息
+    # ======================================================
+    def generate_counterfactual_image(self, z_s_map, z_p_map, strategy='global'):
+        """
+        生成反事实图像，并返回用于诊断的中间统计量。
+        Args:
+            z_s_map: [B, C_s, H, W] 当前 batch 的结构特征
+            z_p_map: [B, C_p, H, W] 当前 batch 的风格特征
+            strategy: 'global' (推荐) 强制 z_p 全局化，避免空间错位; 'spatial' 直接拼接
+        Returns:
+            I_cfa: [B, 3, H, W] 反事实图像
+            diagnostics: dict, 包含 norm, std 等统计量
+        """
+        B = z_s_map.size(0)
+
+        # 1. 随机打乱索引 (Shuffle)
+        perm_idx = torch.randperm(B, device=z_s_map.device)
+        z_p_shuffled = z_p_map[perm_idx]
+
+        # 2. 风格特征处理 (Global Pooling 强制抹除空间信息)
+        if strategy == 'global':
+            # [B, C, H, W] -> [B, C, 1, 1]
+            z_p_content = z_p_shuffled.mean(dim=[2, 3], keepdim=True)
+            # Broadcast 回 [B, C, H, W]
+            z_p_inject = z_p_content.expand_as(z_p_map)
+        else:
+            # 危险：直接拼接，可能导致空间错位
+            z_p_inject = z_p_shuffled
+
+        # 3. 特征拼接 (The Frankenstein Feature)
+        z_mix = torch.cat([z_s_map, z_p_inject], dim=1)
+
+        # 4. 解码生成图像
+        recon_app_logits, _ = self.decoder_app(z_mix)
+        I_cfa = self.final_app_activation(recon_app_logits)
+
+        # =================================================
+        # [诊断探针数据]
+        # 计算特征空间的偏移量，判断是否“掉出流形”
+        # =================================================
+        with torch.no_grad():
+            # 原始 z_s 的范数
+            norm_zs = z_s_map.norm(p=2, dim=1).mean()
+            # 注入 z_p 的范数
+            norm_zp = z_p_inject.norm(p=2, dim=1).mean()
+            # 混合后特征的统计量 (如果极大或极小，说明分布崩了)
+            mix_mean = z_mix.mean()
+            mix_std = z_mix.std()
+
+        diagnostics = {
+            "norm_zs": norm_zs.item(),
+            "norm_zp": norm_zp.item(),
+            "mix_mean": mix_mean.item(),
+            "mix_std": mix_std.item()
+        }
+
+        return I_cfa, diagnostics
 
     def forward(self, x, stage: int = 2):
         # 1. 特征提取

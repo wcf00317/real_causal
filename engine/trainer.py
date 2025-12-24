@@ -3,13 +3,32 @@ from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
 from tqdm import tqdm
 import os, logging
 import numpy as np
+from contextlib import contextmanager
+
 from .evaluator import evaluate
 from utils.general_utils import save_checkpoint
 
 
 # ----------------------------
-# utils
+# Utils & Helpers
 # ----------------------------
+
+@contextmanager
+def bn_protection_mode(model):
+    """
+    CFA 上下文管理器：
+    在处理反事实样本时，临时将模型切换到 eval 模式（针对 BN）。
+    防止分布偏移的 'Frankenstein' 特征污染全局 BN 统计量。
+    """
+    was_training = model.training
+    model.eval()
+    try:
+        yield
+    finally:
+        if was_training:
+            model.train()
+
+
 def _set_requires_grad(module, requires_grad: bool):
     if module is None:
         return
@@ -19,47 +38,33 @@ def _set_requires_grad(module, requires_grad: bool):
 
 def _switch_stage_freeze(model, stage: int):
     """
-    针对新版 CausalMTLModel 的冻结策略。
-    Model 结构:
-      - encoder, projector_s, projector_p (Shared)
-      - head_seg, head_depth, head_normal (Task Heads, depend on Z_s)
-      - decoder_app, albedo_head, etc. (Recon/Decomp, depend on Z_p)
+    根据 Stage 切换冻结状态
     """
-    # 基础检查，防止传入不兼容的模型 (如 RawMTL)
-    if not hasattr(model, 'projector_p'):
-        return
+    if not hasattr(model, 'projector_p'): return
 
-    # === Stage 0: 分解预热 (Decomposition Warmup) ===
-    # 目标：强迫 Encoder 学习物理分解 (Z_p -> Albedo, Z_s -> Normal_phys)，
-    #      而不被下游任务的梯度干扰。
+    # Stage 0: Decomposition Warmup (冻结任务头)
     if stage == 0:
-        # 1. 冻结下游任务头 (只接收 Z_s)
         _set_requires_grad(model.head_seg, False)
         _set_requires_grad(model.head_depth, False)
         _set_requires_grad(model.head_normal, False)
 
-        # 2. 确保分解头和投影层是解冻的
+        # 确保分解部分解冻
         _set_requires_grad(model.projector_s, True)
         _set_requires_grad(model.projector_p, True)
         _set_requires_grad(model.albedo_head, True)
         _set_requires_grad(model.normal_head, True)
         _set_requires_grad(model.light_head, True)
         _set_requires_grad(model.decoder_app, True)
+        # logging.info("❄️ Stage-0: Task Heads FROZEN.")
 
-        logging.info("❄️ Stage-0: Decomposition Warmup. Task Heads FROZEN. Training Recon/Decomp only.")
-
-    # === Stage 1 & 2: 联合训练 (Joint Training) ===
-    # 解冻所有部分，开始训练下游任务
+    # Stage 1 & 2: Full Joint Training
     else:
         _set_requires_grad(model.head_seg, True)
         _set_requires_grad(model.head_depth, True)
         _set_requires_grad(model.head_normal, True)
-
-        # 确保其他部分也是解冻的
         _set_requires_grad(model.projector_s, True)
         _set_requires_grad(model.projector_p, True)
-
-        logging.info(f"🔥 Stage-{stage}: Full Joint Training. All components UNFROZEN.")
+        # logging.info(f"🔥 Stage-{stage}: All components UNFROZEN.")
 
 
 def _get_lr(optimizer):
@@ -73,9 +78,6 @@ def _set_lr(optimizer, lr):
 
 
 def _build_scheduler(optimizer, train_cfg):
-    """
-    自动构建调度器：Cosine 或 Step
-    """
     base_lr = float(train_cfg.get("learning_rate", 1e-4))
     sched_cfg = train_cfg.get("lr_scheduler", {}) or {}
     sched_type = str(sched_cfg.get("type", "cosine")).lower()
@@ -85,98 +87,16 @@ def _build_scheduler(optimizer, train_cfg):
         min_lr_factor = float(sched_cfg.get("min_lr_factor", 0.1))
         total_epochs = int(train_cfg.get("epochs", 30))
         t_max = int(sched_cfg.get("T_max", max(1, total_epochs - warmup_epochs)))
-        cosine = CosineAnnealingLR(
-            optimizer,
-            T_max=t_max,
-            eta_min=base_lr * min_lr_factor
-        )
-        return {
-            "type": "cosine",
-            "warmup_epochs": warmup_epochs,
-            "base_lr": base_lr,
-            "cosine": cosine
-        }
+        cosine = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=base_lr * min_lr_factor)
+        return {"type": "cosine", "warmup_epochs": warmup_epochs, "base_lr": base_lr, "cosine": cosine}
 
-    # fallback: StepLR
     step_size = int(sched_cfg.get("step_size", 100))
     gamma = float(sched_cfg.get("gamma", 0.5))
     step = StepLR(optimizer, step_size=step_size, gamma=gamma)
-    return {
-        "type": "step",
-        "step": step
-    }
-
-
-# ----------------------------
-# train loops
-# ----------------------------
-def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, stage: int):
-    model.train()
-    total_train_loss = 0.0
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1} [Training]", leave=False)
-
-    # 累积梯度步数
-    target_bs = 16
-    physical_bs = train_loader.batch_size
-    accumulation_steps = max(1, target_bs // physical_bs)
-
-    optimizer.zero_grad(set_to_none=True)
-
-    for i, batch in enumerate(pbar):
-        batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
-        rgb = batch['rgb']
-
-        # 前向传播 (FP32)
-        outputs = model(rgb, stage=stage)
-
-        crit_out = criterion(outputs, batch)
-
-        # 解析 Loss 返回值
-        if isinstance(crit_out, (tuple, list)):
-            total_loss, loss_dict = crit_out[0], crit_out[1]
-        elif isinstance(crit_out, dict):
-            loss_dict = crit_out
-            total_loss = loss_dict.get('total_loss')
-        else:
-            raise ValueError("criterion must return dict or (total_loss, dict).")
-
-        # 打印最后一个 batch 的 loss
-        if i == len(pbar) - 1:
-            # 简化 log，避免刷屏
-            simple_log = {k: float(f"{v:.4f}") for k, v in loss_dict.items() if
-                          isinstance(v, (float, torch.Tensor)) and v > 0.001}
-            logging.info(f"Epoch {epoch + 1} Loss: {simple_log}")
-
-        loss_normalized = total_loss / accumulation_steps
-        loss_normalized.backward()
-
-        # 梯度更新
-        if (i + 1) % accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-
-        # 记录 Loss
-        loss_val = total_loss.item()
-        if not np.isfinite(loss_val):
-            logging.info(f"⚠️ Warning: Non-finite loss {loss_val} at step {i}")
-
-        total_train_loss += float(loss_val)
-        pbar.set_postfix(loss=f"{loss_val:.4f}")
-
-    # 处理剩余梯度
-    if len(train_loader) % accumulation_steps != 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-
-    avg_train_loss = total_train_loss / max(1, len(train_loader))
-    logging.info(f"Epoch {epoch + 1} - Avg Loss: {avg_train_loss:.4f}")
-    return avg_train_loss
+    return {"type": "step", "step": step}
 
 
 def calculate_improvement(base_metrics, current_metrics, data_type='nyuv2'):
-    """相对提升率计算"""
     improvement = 0
     count = 0
     # 1=越大越好, 0=越小越好
@@ -187,12 +107,12 @@ def calculate_improvement(base_metrics, current_metrics, data_type='nyuv2'):
         'normal_median_angle': 0, 'normal_acc_11': 1, 'normal_acc_22': 1
     }
 
+    # 根据数据集类型过滤有效指标
+    valid_keys = set(metric_meta.keys())
     if 'gta5' in data_type:
         valid_keys = {'seg_miou', 'seg_pixel_acc'}
     elif data_type == 'cityscapes':
         valid_keys = {'seg_miou', 'seg_pixel_acc', 'depth_abs_err', 'depth_rel_err'}
-    else:
-        valid_keys = set(metric_meta.keys())
 
     for k, direction in metric_meta.items():
         if k not in valid_keys: continue
@@ -200,15 +120,170 @@ def calculate_improvement(base_metrics, current_metrics, data_type='nyuv2'):
             base = base_metrics[k]
             curr = current_metrics[k]
             if base == 0: continue
-
             if direction == 1:
                 imp = (curr - base) / base
             else:
                 imp = (base - curr) / base
             improvement += imp
             count += 1
-
     return improvement / max(1, count)
+
+
+# ----------------------------
+# Core Training Functions
+# ----------------------------
+
+def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, stage: int, config):
+    model.train()
+
+    # --- 指标追踪器 ---
+    metrics_tracker = {
+        "main_loss": [],
+        "cfa_loss": [],
+        "cfa_ratio": [],  # CFA Task Loss / Main Task Loss
+        "z_drift": []  # 特征漂移 (MixStd)
+    }
+
+    # --- 读取 CFA 配置 ---
+    cfa_cfg = config.get('training', {}).get('cfa', {})
+    cfa_enabled = cfa_cfg.get('enabled', False)
+    cfa_start_epoch = cfa_cfg.get('start_epoch', 10)
+    cfa_cka_thresh = cfa_cfg.get('cka_threshold', 0.15)
+    cfa_prob = cfa_cfg.get('prob', 0.5)
+    lambda_cfa = cfa_cfg.get('lambda_cfa', 1.0)
+
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}", leave=False)
+    accumulation_steps = 1
+    optimizer.zero_grad(set_to_none=True)
+
+    for i, batch in enumerate(pbar):
+        batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
+        rgb = batch['rgb']
+
+        # ==========================
+        # 1. Main Forward
+        # ==========================
+        outputs = model(rgb, stage=stage)
+        crit_out = criterion(outputs, batch)
+
+        if isinstance(crit_out, (tuple, list)):
+            loss_main, loss_dict = crit_out
+        else:
+            loss_dict = crit_out
+            loss_main = loss_dict['total_loss']
+
+        # 记录基础指标
+        current_cka = loss_dict.get('independence_loss', torch.tensor(1.0)).item()
+        metrics_tracker["main_loss"].append(loss_main.item())
+
+        # ==========================
+        # 2. CFA (Counterfactual)
+        # ==========================
+        loss_cfa_val = 0.0
+        cfa_active = False
+        cfa_diagnostics = {}
+
+        # 准入条件判断
+        cond_stage = stage >= 2
+        cond_epoch = epoch >= cfa_start_epoch
+        cond_cka = current_cka < cfa_cka_thresh
+        cond_batch = rgb.size(0) > 1
+
+        if cfa_enabled and cond_stage and cond_epoch and cond_cka and cond_batch:
+            if torch.rand(1).item() < cfa_prob:
+                cfa_active = True
+
+                # A. 生成反事实样本 (阻断梯度回传给 Decoder)
+                z_s_map = outputs['z_s_map'].detach()
+                z_p_map = outputs['z_p_map'].detach()
+
+                # 调用模型内部方法生成
+                I_cfa, diag_stats = model.generate_counterfactual_image(
+                    z_s_map, z_p_map, strategy=cfa_cfg.get('mix_strategy', 'global')
+                )
+                I_cfa = I_cfa.detach()
+
+                # [Probe] 记录混合特征的标准差
+                metrics_tracker["z_drift"].append(diag_stats.get('mix_std', 0.0))
+
+                # B. 反事实前向传播 (BN Protected!)
+                with bn_protection_mode(model):
+                    out_cfa = model(I_cfa, stage=stage)
+
+                    # C. 计算 CFA Loss
+                    _, cfa_loss_dict = criterion(out_cfa, batch)
+                    l_cfa_task = cfa_loss_dict.get('task_loss', torch.tensor(0.0))
+                    l_cfa_ind = cfa_loss_dict.get('independence_loss', torch.tensor(0.0))
+
+                    loss_cfa = lambda_cfa * (l_cfa_task + 0.1 * l_cfa_ind)
+
+                # [Probe] 计算 Loss 比率 (Confusion Ratio)
+                main_task_loss = loss_dict.get('task_loss', torch.tensor(1.0)).item()
+                cfa_task_loss_val = l_cfa_task.item()
+                ratio = cfa_task_loss_val / (main_task_loss + 1e-6)
+                metrics_tracker["cfa_ratio"].append(ratio)
+
+                loss_cfa_val = loss_cfa.item()
+                total_loss = loss_main + loss_cfa
+
+                cfa_diagnostics = {
+                    "Ratio": f"{ratio:.1f}x",
+                    "MixStd": f"{diag_stats.get('mix_std', 0.0):.2f}"
+                }
+            else:
+                total_loss = loss_main
+        else:
+            total_loss = loss_main
+
+        # ==========================
+        # 3. 日志与反向传播
+        # ==========================
+
+        # 每 20 个 step 打印一次详细诊断，或者发现严重异常时打印
+        if cfa_active and (i % 20 == 0 or metrics_tracker["cfa_ratio"][-1] > 3.0):
+            msg = f"[Iter {i}] MainL:{loss_main.item():.3f} CKA:{current_cka:.3f} | [CFA ON] CFAL:{loss_cfa_val:.3f} Ratio:{cfa_diagnostics['Ratio']} Z_Std:{cfa_diagnostics['MixStd']}"
+            if float(cfa_diagnostics['Ratio'][:-1]) > 3.0:
+                logging.warning(f"⚠️ [Probe Alert] High CFA Confusion! {msg}")
+            else:
+                logging.info(msg)
+
+        # 仅在 epoch 开始的几个 batch 打印跳过原因，避免刷屏
+        elif not cfa_active and cfa_enabled and i < 5:
+            reasons = []
+            if not cond_epoch: reasons.append(f"WaitEpoch({epoch}<{cfa_start_epoch})")
+            if not cond_cka: reasons.append(f"HighCKA({current_cka:.2f})")
+            if not cond_stage: reasons.append("PretrainStage")
+            if reasons:
+                logging.info(f"[Iter {i}] MainL:{loss_main.item():.3f} | [CFA SKIP] {','.join(reasons)}")
+
+        total_loss.backward()
+
+        if (i + 1) % accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        # 更新进度条
+        pf = {
+            'L': f"{loss_main.item():.2f}",
+            'CKA': f"{current_cka:.2f}"
+        }
+        if cfa_active:
+            pf['CFA'] = f"{loss_cfa_val:.2f}"
+        pbar.set_postfix(pf)
+
+    # --- Epoch Summary ---
+    avg_main = np.mean(metrics_tracker["main_loss"])
+    avg_cfa = np.mean(metrics_tracker["cfa_loss"]) if metrics_tracker["cfa_loss"] else 0.0
+    avg_ratio = np.mean(metrics_tracker["cfa_ratio"]) if metrics_tracker["cfa_ratio"] else 0.0
+
+    logging.info(f"Epoch {epoch + 1} Report:")
+    logging.info(f"  > Avg Main Loss : {avg_main:.4f}")
+    if cfa_enabled and len(metrics_tracker["cfa_loss"]) > 0:
+        logging.info(f"  > Avg CFA Loss  : {avg_cfa:.4f}")
+        logging.info(f"  > Avg Confusion : {avg_ratio:.2f}x (Ratio > 1.5 indicates difficulty)")
+
+    return avg_main
 
 
 def train(model, train_loader, val_loader, optimizer, criterion, scheduler, config, device,
@@ -284,7 +359,9 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
         logging.info(f"\n----- Epoch {epoch + 1}/{total_epochs} (Stage {stage}) | lr={cur_lr:.6f} -----")
 
         # --- Train & Validate ---
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, stage=stage)
+        # [MODIFIED] 这里传入了 config 以启用 CFA 配置读取
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, stage=stage,
+                                     config=config)
         val_metrics = evaluate(model, val_loader, criterion, device, stage=stage, data_type=data_type)
 
         # --- Scheduler Step ---
