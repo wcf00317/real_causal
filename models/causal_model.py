@@ -282,6 +282,8 @@ class CausalMTLModel(nn.Module):
 
         outputs = {
             'z_s': z_s, 'z_p': z_p,
+            'z_s_map': z_s_map,
+            'z_p_map': z_p_map,
             'pred_seg': pred_seg, 'pred_depth': pred_depth, 'pred_normal': pred_normal,
 
             # 物理分解输出

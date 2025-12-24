@@ -128,7 +128,7 @@ def _visualize_mixer(model, batch_a, batch_b, device, save_path, scene_class_map
         Normal_A = model.normal_head(out_a['z_s_map'])  # [1, 3, H, W]
 
         # 外观源: B
-        Albedo_B = model.albedo_head(out_b['z_p_seg_map'])  # [1, 3, H, W]
+        Albedo_B = model.albedo_head(out_b['z_p_map'])  # [1, 3, H, W]
 
         # 光照源: B (需要重新提取 h)
         _, h_b, _,_ = model.extract_features(rgb_b)

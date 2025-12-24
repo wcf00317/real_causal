@@ -178,7 +178,7 @@ class CompositeLoss(nn.Module):
         # ===== 3. 重构 Loss (Reconstruction) =====
 
         # 3.1 几何重构 (Z_s -> Depth)
-        if self.weights.get('alpha_recon_geom', 0) > 0:
+        if self.weights.get('alpha_recon_geom') > 0:
             l_recon_g = self.recon_geom_loss(outputs['recon_geom'], targets['depth'])
         else:
             l_recon_g = torch.tensor(0.0, device=_dev)
@@ -216,10 +216,16 @@ class CompositeLoss(nn.Module):
                                                F.interpolate(targets['appearance_target'],
                                                              size=outputs['recon_app_aux'].shape[2:], mode='bilinear'))
 
+        l_edge = torch.tensor(0.0, device=_dev)
+        if self.weights.get('lambda_edge_consistency') > 0:
+            if 'pred_depth' in outputs and 'depth' in targets:
+                l_edge = self.edge_consistency_loss(outputs['pred_depth'], targets['depth'])
+
         loss_dict.update({
             'recon_geom_loss': l_recon_g,
             'recon_app_loss': l_recon_a,
-            'decomp_img': l_img_decomp
+            'decomp_img': l_img_decomp,
+            'edge_loss': l_edge,
         })
 
         # ===== 4. 总 Loss =====
@@ -229,12 +235,13 @@ class CompositeLoss(nn.Module):
                 self.weights['alpha_recon_geom'] * l_recon_g +
                 self.weights['beta_recon_app'] * l_recon_a +
                 self.weights['lambda_img'] * l_img_decomp +
+                self.weights.get('lambda_edge_consistency') * l_edge +
                 # 辅助项
                 0.5 * l_recon_g_aux +
                 0.5 * l_recon_a_aux +
-                self.weights.get('lambda_alb_tv', 0) * l_alb_tv +
-                self.weights.get('lambda_sh_gray', 0) * l_sh_gray +
-                self.weights.get('lambda_xcov', 0) * l_xcov
+                self.weights.get('lambda_alb_tv') * l_alb_tv +
+                self.weights.get('lambda_sh_gray') * l_sh_gray +
+                self.weights.get('lambda_xcov') * l_xcov
         )
 
         loss_dict['total_loss'] = total_loss

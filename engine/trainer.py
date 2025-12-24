@@ -229,6 +229,9 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
     best_epoch = 0
     best_metrics_details = {}
 
+    # [NEW] 计算 Stage 2 正式开始的 Epoch 索引
+    stage2_start_epoch = stage0_epochs + stage1_epochs
+
     sched = _build_scheduler(optimizer, train_cfg)
     logging.info(f"[LR Scheduler] {sched['type']}; base_lr={base_lr}")
 
@@ -236,7 +239,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
         # --- Stage Logic ---
         if epoch < stage0_epochs:
             stage = 0
-        elif epoch < stage1_epochs + stage0_epochs:  # 如果有stage1的话
+        elif epoch < stage1_epochs + stage0_epochs:
             stage = 1
         else:
             stage = 2
@@ -248,11 +251,12 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
             logging.info(f"🔍 [Training Strategy] Total Epochs: {total_epochs}")
             logging.info(f"   Stage 0 (Decomp Only): 0 -> {stage0_epochs}")
             logging.info(f"   Stage 2 (Joint Train): {stage0_epochs} -> {total_epochs}")
+            logging.info(f"   Baseline will be FIXED at Epoch {stage2_start_epoch + 1} (Start of Stage 2)")
 
         # --- Lambda Decay/Warmup Strategy ---
         current_ind_lambda = target_ind_lambda
 
-        # 在 Stage 0 强制 lambda 为 0，因为分解阶段只需要物理Loss
+        # 在 Stage 0 强制 lambda 为 0
         if stage == 0:
             current_ind_lambda = 0.0
         # 如果还在 Warmup 期间
@@ -290,29 +294,60 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
         else:
             sched["step"].step()
 
-        # --- Best Model Selection ---
-        # Stage 0 不参与 Score 比较
-        if stage == 0:
-            logging.info("  -> Stage 0 (Decomp) - Skipping improvement calculation.")
-            baseline_metrics = val_metrics  # 不断更新 baseline 直到 Stage 0 结束
-        else:
-            if baseline_metrics is None:
-                baseline_metrics = val_metrics
+        # --- Best Model Selection (Fixed Baseline Logic) ---
+        is_best = False
+        score = 0.0
 
-            score = calculate_improvement(baseline_metrics, val_metrics, data_type=data_type)
-            is_best = (score > best_relative_score)
+        # Stage 0 & 1: 不计算 Score，跳过
+        if stage < 2:
+            logging.info(f"  -> Stage {stage} (Pre-training) - Skipping improvement calculation.")
+            baseline_metrics = None  # 确保不使用预训练阶段作为基准
 
-            if is_best:
-                best_relative_score = score
-                best_epoch = epoch + 1
-                best_metrics_details = val_metrics.copy()
-                logging.info(f"  -> 🏆 Best Model! Score: {score:.2%}")
-
+            # 依然保存 checkpoint，方便调试
             save_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'best_score': best_relative_score,
-            }, is_best, checkpoint_dir=checkpoint_dir)
+            }, False, checkpoint_dir=checkpoint_dir)
+
+        else:
+            # Stage 2: 只有进入联合训练阶段才开始评测
+            if epoch == stage2_start_epoch:
+                # 刚进入 Stage 2 的第一轮 -> 强制锁定为 Baseline
+                baseline_metrics = val_metrics
+                logging.info(f"  -> 🏁 Stage 2 Started. Setting FIXED BASELINE from current epoch.")
+
+                # 保存一份作为 Stage 2 起点的存档
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'state_dict': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'best_score': 0.0,
+                    'baseline_metrics': baseline_metrics,
+                }, False, checkpoint_dir=checkpoint_dir, filename='checkpoint_stage2_start.pth.tar')
+
+            elif baseline_metrics is not None:
+                # Stage 2 后续轮次 -> 与锁定的 Baseline 比较
+                score = calculate_improvement(baseline_metrics, val_metrics, data_type=data_type)
+                is_best = (score > best_relative_score)
+
+                if is_best:
+                    best_relative_score = score
+                    best_epoch = epoch + 1
+                    best_metrics_details = val_metrics.copy()
+                    logging.info(f"  -> 🏆 Best Model (vs Stage2-Start)! Score: {score:.2%}")
+
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'state_dict': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'best_score': best_relative_score,
+                    'baseline_metrics': baseline_metrics,
+                }, is_best, checkpoint_dir=checkpoint_dir)
+            else:
+                # 防御性代码：如果是断点续训且没加载到 baseline，以当前为准
+                logging.info("  -> Warning: No baseline found (resumed?), setting current as baseline.")
+                baseline_metrics = val_metrics
 
     logging.info(f"\n✅ Training Finished. Best Epoch: {best_epoch}, Score: {best_relative_score:.2%}")

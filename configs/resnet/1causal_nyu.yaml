@@ -31,7 +31,7 @@ training:
   # [已删除] gate_lr: 0.02 (因为融合门控模块已彻底移除)
 
   # === 时间表控制 ===
-  stage0_epochs: 2     # 阶段0: 仅训练分解重构 (A*S=I)，不更新任务头
+  stage0_epochs: 5     # 阶段0: 仅训练分解重构 (A*S=I)，不更新任务头
   stage1_epochs: 0     # 阶段1: 强力预热 (可视情况设为 0-5)
   ind_warmup_epochs: 10 # CKA 损失从第 10 epoch 开始介入
 
@@ -47,6 +47,7 @@ losses:
   lambda_depth: 10.0
   lambda_normal: 10.0
   # lambda_scene: 0.0 (代码中未涉及 Scene Head，设为0或删除)
+  lambda_edge_consistency: 0.1
 
   # [已删除] lambda_depth_zp: 1.0
   # 原因：因果解耦要求 Zp 不能包含几何信息，因此我们删除了 Zp->Depth 的预测路径
