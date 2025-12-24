@@ -1,0 +1,76 @@
+data:
+  type: "nyuv2"
+  dataset_path: "../mtl_dataset/nyuv2"
+  batch_size: 32   # 如果显存允许，尽量开大
+  num_workers: 4
+  img_size: [288, 384]
+
+model:
+  type: "causal"
+  encoder_name: "resnet50"
+  pretrained: True
+  latent_dim_s: 1024
+  latent_dim_p: 2048
+  z_s_bottleneck_noise: 0.1 # 稍微加点噪声防止过拟合
+
+  # 物理分解头配置 (对应 models/causal_model.py 中的 decomposition parts)
+  decomposition:
+    enabled: true
+    normal_head_hidden: 128
+    albedo_head_hidden: 128
+    light_head:
+      sh_degree: 2
+      grayscale_prior: true
+
+training:
+  seed: 2024
+  epochs: 100
+  optimizer: "AdamW"
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+  # [已删除] gate_lr: 0.02 (因为融合门控模块已彻底移除)
+
+  # === 时间表控制 ===
+  stage0_epochs: 2     # 阶段0: 仅训练分解重构 (A*S=I)，不更新任务头
+  stage1_epochs: 0     # 阶段1: 强力预热 (可视情况设为 0-5)
+  ind_warmup_epochs: 10 # CKA 损失从第 10 epoch 开始介入
+
+  lr_scheduler:
+    type: "cosine"
+    warmup_epochs: 5
+    min_lr_factor: 0.01
+
+losses:
+  # === 1. 核心任务 Loss (Zs -> Tasks) ===
+  # 建议权重稍微加大，保证 Zs 包含足够的语义结构信息
+  lambda_seg: 20.0
+  lambda_depth: 10.0
+  lambda_normal: 10.0
+  # lambda_scene: 0.0 (代码中未涉及 Scene Head，设为0或删除)
+
+  # [已删除] lambda_depth_zp: 1.0
+  # 原因：因果解耦要求 Zp 不能包含几何信息，因此我们删除了 Zp->Depth 的预测路径
+
+  # === 2. 独立性约束 (CKA Loss) ===
+  # 强制 Zs 和 Zp 统计独立
+  lambda_independence: 1.0
+
+  # === 3. 重构 Loss (Reconstruction) ===
+  # 几何重构 (Zs -> Depth)
+  alpha_recon_geom: 2.0
+
+  # 外观重构 (Zs + Zp -> Image)
+  beta_recon_app: 2.0
+  lambda_l1_recon: 1.0
+
+  # (注：Auxiliary loss 的权重在代码中固定为 0.5，此处无需配置)
+
+  # === 4. 物理分解与先验 (Decomposition Priors) ===
+  # 确保 Zp 学习到的是 Albedo 纹理，而不是随便什么高频信息
+  lambda_img: 2.0        # A*S 与原图的 L1 Loss
+  lambda_alb_tv: 0.1     # Albedo 平滑性 (Total Variation)
+  lambda_sh_gray: 0.1    # Shading 灰度偏好
+  lambda_xcov: 0.5       # Albedo 和 Normal 的去相关 (Cross Covariance)
+
+  # [已删除] 复杂的边缘一致性 Loss (seg_edge_from_geom 等)
+  # 原因：已在代码瘦身过程中移除，以保证 Pipeline 的纯粹性
