@@ -1,0 +1,88 @@
+data:
+  type: "gta5_to_cityscapes"
+  train_dataset_path: "/data/chengfengwu/alrl/mtl_dataset/gta5/train"
+
+  # 目标域验证集 (Cityscapes Val) - 用于选最佳模型 (Oracle Selection)
+  val_dataset_path: "/data/chengfengwu/alrl/mtl_dataset/cityscape_preprocess"
+
+  # 源域验证集 (GTA5 Val) - main.py 不会自动跑，需用 test_gta5.py 跑
+  source_val_path: "/data/chengfengwu/alrl/mtl_dataset/gta5/val"
+
+  batch_size: 32
+  num_workers: 4
+  img_size: [128, 256] # 必须与 gta5_dataset.py 中的处理一致
+  pin_memory: True
+
+model:
+  type: "causal"
+  encoder_name: "resnet50"
+  pretrained: True
+
+  # 【关键】必须设为 7，因为 gta5_dataset.py 把标签映射到了 7 类
+  num_seg_classes: 7
+
+  latent_dim_s: 1024
+  latent_dim_p: 64
+  z_s_bottleneck_noise: 0.1
+
+  decomposition:
+    enabled: true
+    normal_head_hidden: 128
+    albedo_head_hidden: 128
+    light_head:
+      sh_degree: 2
+      grayscale_prior: true
+
+training:
+  seed: 42
+  epochs: 100
+  optimizer: "AdamW"
+  learning_rate: 0.0001 # 迁移学习通常 LR 较小
+  weight_decay: 0.0005
+
+  # 阶段控制
+  stage0_epochs: 5      # 预热分解
+  stage1_epochs: 5      # 预热任务头
+  ind_warmup_epochs: 50 # 10 epoch 后开启独立性约束
+
+  lr_scheduler:
+    type: "cosine"
+    warmup_epochs: 5
+    min_lr_factor: 0.01
+
+  # 【反事实增强】 Sim-to-Real 的核心，建议开启
+  cfa:
+    enabled: true
+    start_epoch: 60
+    prob: 0.5
+    lambda_cfa: 1.0
+    cka_threshold: 0.2
+    mix_strategy: "global"
+
+losses:
+  # === 任务 Loss ===
+  lambda_seg: 50.0
+
+  # 【关键】GTA5 没有深度真值，必须设为 0，否则模型会崩塌
+  lambda_depth: 0.0
+
+  lambda_normal: 0.0 # 除非您有 GTA5 的法线真值，否则也设为 0
+  lambda_edge_consistency: 0.0
+
+  # === 独立性 Loss ===
+  lambda_independence: 0.5 # 稍微降低，因为跨域很难完全解耦
+
+  # === 重构 Loss ===
+  # 即使没有深度监督，也可以尝试无监督的几何重构约束（如果有辅助Loss支持），
+  # 但稳妥起见，若无深度真值，建议降低或关闭几何重构权重
+  alpha_recon_geom: 0.0
+
+  # 外观重构必须保留
+  beta_recon_app: 0.1
+  lambda_l1_recon: 1.0
+
+  # === 物理分解约束 ===
+  lambda_img: 1.0
+  lambda_alb_tv: 0.1
+  lambda_sh_gray: 0.1
+  lambda_xcov: 0.1

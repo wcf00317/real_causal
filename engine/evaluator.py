@@ -129,8 +129,8 @@ def evaluate(model, val_loader, criterion, device, stage, data_type):
 
     # 3. Normal
     if 'nyuv2' in str(data_type).lower():
-        logging.info(f"[Normal] Mean Ang: {mean_angle:<7.2f}° | Median:    {median_angle:<7.2f}°")
-        logging.info(f"         Acc 11°:  {acc_11:<7.3f} | Acc 22°:   {acc_22:<7.3f} | Acc 30°: {acc_30:<7.3f}")
+        logging.info(f"[Normal] Mean Ang: {mean_angle:<7.4f}° | Median:    {median_angle:<7.4f}°")
+        logging.info(f"         Acc 11°:  {acc_11:<7.4f} | Acc 22°:   {acc_22:<7.4f} | Acc 30°: {acc_30:<7.4f}")
     logging.info("-" * 60)
 
     # Reset metrics

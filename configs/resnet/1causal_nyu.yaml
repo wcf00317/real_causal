@@ -11,7 +11,7 @@ model:
   encoder_name: "resnet50"
   pretrained: True
   latent_dim_s: 1024
-  latent_dim_p: 2048
+  latent_dim_p: 64
   z_s_bottleneck_noise: 0.1 # 稍微加点噪声防止过拟合
 
   # 物理分解头配置 (对应 models/causal_model.py 中的 decomposition parts)
@@ -25,7 +25,7 @@ model:
 
 training:
   seed: 2024
-  epochs: 100
+  epochs: 200
   optimizer: "AdamW"
   learning_rate: 0.0002
   weight_decay: 0.0001
@@ -40,6 +40,14 @@ training:
     type: "cosine"
     warmup_epochs: 5
     min_lr_factor: 0.01
+
+  cfa:
+    enabled: true
+    start_epoch: 110
+    cka_threshold: 0.1
+    prob: 0.5
+    lambda_cfa: 1.0
+    mix_strategy: "global"
 
 losses:
   # === 1. 核心任务 Loss (Zs -> Tasks) ===

@@ -136,21 +136,53 @@ def calculate_improvement(base_metrics, current_metrics, data_type='nyuv2'):
 def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, stage: int, config):
     model.train()
 
+    # ==========================================================================
+    # 1. 鲁棒的 CFA 配置读取 (Robust Configuration Parsing)
+    #    原则：显式优于隐式，拒绝默认值。
+    # ==========================================================================
+    train_cfg = config.get('training', {})
+    cfa_cfg = train_cfg.get('cfa', None)  # 获取 CFA 配置块，如果没写则为 None
+
+    cfa_enabled = False  # 默认为 False，除非配置文件显式开启
+
+    # 只有当配置文件里写了 'cfa' 块时，才进行检查
+    if cfa_cfg is not None:
+        # [Rule 1] 强制要求 'enabled' 字段
+        if 'enabled' not in cfa_cfg:
+            raise ValueError(
+                "❌ Config Error: Found 'cfa' block in config, but 'enabled' key is missing.\n"
+                "   You MUST explicitly set 'enabled: true' or 'enabled: false'."
+            )
+
+        cfa_enabled = cfa_cfg['enabled']
+
+        # [Rule 2] 只有开启时才检查参数，且不允许缺省
+        if cfa_enabled:
+            required_params = ['start_epoch', 'cka_threshold', 'prob', 'lambda_cfa', 'mix_strategy']
+            missing_params = [k for k in required_params if k not in cfa_cfg]
+
+            if missing_params:
+                raise ValueError(
+                    f"❌ Config Error: CFA is enabled, but the following required parameters are missing: {missing_params}.\n"
+                    "   We do not use default values. Please specify them in your yaml file."
+                )
+
+            # 安全读取 (既然通过了上面的检查，这里一定有值)
+            cfa_start_epoch = cfa_cfg['start_epoch']
+            cfa_cka_thresh = cfa_cfg['cka_threshold']
+            cfa_prob = cfa_cfg['prob']
+            lambda_cfa = cfa_cfg['lambda_cfa']
+            cfa_mix_strategy = cfa_cfg['mix_strategy']
+
+    # ==========================================================================
+
     # --- 指标追踪器 ---
     metrics_tracker = {
         "main_loss": [],
         "cfa_loss": [],
-        "cfa_ratio": [],  # CFA Task Loss / Main Task Loss
-        "z_drift": []  # 特征漂移 (MixStd)
+        "cfa_ratio": [],
+        "z_drift": []
     }
-
-    # --- 读取 CFA 配置 ---
-    cfa_cfg = config.get('training', {}).get('cfa', {})
-    cfa_enabled = cfa_cfg.get('enabled', False)
-    cfa_start_epoch = cfa_cfg.get('start_epoch', 10)
-    cfa_cka_thresh = cfa_cfg.get('cka_threshold', 0.15)
-    cfa_prob = cfa_cfg.get('prob', 0.5)
-    lambda_cfa = cfa_cfg.get('lambda_cfa', 1.0)
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}", leave=False)
     accumulation_steps = 1
@@ -161,7 +193,7 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, st
         rgb = batch['rgb']
 
         # ==========================
-        # 1. Main Forward
+        # Step 1: Main Forward (Pass 1)
         # ==========================
         outputs = model(rgb, stage=stage)
         crit_out = criterion(outputs, batch)
@@ -176,8 +208,11 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, st
         current_cka = loss_dict.get('independence_loss', torch.tensor(1.0)).item()
         metrics_tracker["main_loss"].append(loss_main.item())
 
+        # [OOM Fix] 立即反向传播释放显存
+        loss_main.backward()
+
         # ==========================
-        # 2. CFA (Counterfactual)
+        # Step 2: CFA Forward (Pass 2)
         # ==========================
         loss_cfa_val = 0.0
         cfa_active = False
@@ -185,25 +220,26 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, st
 
         # 准入条件判断
         cond_stage = stage >= 2
-        cond_epoch = epoch >= cfa_start_epoch
-        cond_cka = current_cka < cfa_cka_thresh
-        cond_batch = rgb.size(0) > 1
 
-        if cfa_enabled and cond_stage and cond_epoch and cond_cka and cond_batch:
-            if torch.rand(1).item() < cfa_prob:
+        # 只有当 cfa_enabled 为 True 时，这些变量才会被定义，所以这里是安全的
+        if cfa_enabled:
+            cond_epoch = epoch >= cfa_start_epoch
+            cond_cka = current_cka < cfa_cka_thresh
+            cond_batch = rgb.size(0) > 1
+
+            should_run_cfa = cond_stage and cond_epoch and cond_cka and cond_batch
+
+            if should_run_cfa and (torch.rand(1).item() < cfa_prob):
                 cfa_active = True
 
-                # A. 生成反事实样本 (阻断梯度回传给 Decoder)
+                # A. 生成反事实样本 (detach!)
                 z_s_map = outputs['z_s_map'].detach()
                 z_p_map = outputs['z_p_map'].detach()
 
-                # 调用模型内部方法生成
                 I_cfa, diag_stats = model.generate_counterfactual_image(
-                    z_s_map, z_p_map, strategy=cfa_cfg.get('mix_strategy', 'global')
+                    z_s_map, z_p_map, strategy=cfa_mix_strategy
                 )
                 I_cfa = I_cfa.detach()
-
-                # [Probe] 记录混合特征的标准差
                 metrics_tracker["z_drift"].append(diag_stats.get('mix_std', 0.0))
 
                 # B. 反事实前向传播 (BN Protected!)
@@ -217,53 +253,38 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, st
 
                     loss_cfa = lambda_cfa * (l_cfa_task + 0.1 * l_cfa_ind)
 
-                # [Probe] 计算 Loss 比率 (Confusion Ratio)
+                # [OOM Fix] 第二次反向传播
+                loss_cfa.backward()
+
+                # Probe
                 main_task_loss = loss_dict.get('task_loss', torch.tensor(1.0)).item()
                 cfa_task_loss_val = l_cfa_task.item()
                 ratio = cfa_task_loss_val / (main_task_loss + 1e-6)
                 metrics_tracker["cfa_ratio"].append(ratio)
 
                 loss_cfa_val = loss_cfa.item()
-                total_loss = loss_main + loss_cfa
-
                 cfa_diagnostics = {
                     "Ratio": f"{ratio:.1f}x",
                     "MixStd": f"{diag_stats.get('mix_std', 0.0):.2f}"
                 }
-            else:
-                total_loss = loss_main
-        else:
-            total_loss = loss_main
 
         # ==========================
-        # 3. 日志与反向传播
+        # Step 3: Optimize & Log
         # ==========================
 
-        # 每 20 个 step 打印一次详细诊断，或者发现严重异常时打印
-        if cfa_active and (i % 20 == 0 or metrics_tracker["cfa_ratio"][-1] > 3.0):
+        if cfa_active and (i % 50 == 0 or metrics_tracker["cfa_ratio"][-1] > 3.0):
             msg = f"[Iter {i}] MainL:{loss_main.item():.3f} CKA:{current_cka:.3f} | [CFA ON] CFAL:{loss_cfa_val:.3f} Ratio:{cfa_diagnostics['Ratio']} Z_Std:{cfa_diagnostics['MixStd']}"
             if float(cfa_diagnostics['Ratio'][:-1]) > 3.0:
                 logging.warning(f"⚠️ [Probe Alert] High CFA Confusion! {msg}")
             else:
                 logging.info(msg)
 
-        # 仅在 epoch 开始的几个 batch 打印跳过原因，避免刷屏
-        elif not cfa_active and cfa_enabled and i < 5:
-            reasons = []
-            if not cond_epoch: reasons.append(f"WaitEpoch({epoch}<{cfa_start_epoch})")
-            if not cond_cka: reasons.append(f"HighCKA({current_cka:.2f})")
-            if not cond_stage: reasons.append("PretrainStage")
-            if reasons:
-                logging.info(f"[Iter {i}] MainL:{loss_main.item():.3f} | [CFA SKIP] {','.join(reasons)}")
-
-        total_loss.backward()
-
         if (i + 1) % accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        # 更新进度条
+        # Update Pbar
         pf = {
             'L': f"{loss_main.item():.2f}",
             'CKA': f"{current_cka:.2f}"
@@ -281,13 +302,16 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, st
     logging.info(f"  > Avg Main Loss : {avg_main:.4f}")
     if cfa_enabled and len(metrics_tracker["cfa_loss"]) > 0:
         logging.info(f"  > Avg CFA Loss  : {avg_cfa:.4f}")
-        logging.info(f"  > Avg Confusion : {avg_ratio:.2f}x (Ratio > 1.5 indicates difficulty)")
+        logging.info(f"  > Avg Confusion : {avg_ratio:.2f}x")
 
     return avg_main
 
 
 def train(model, train_loader, val_loader, optimizer, criterion, scheduler, config, device,
-          checkpoint_dir='checkpoints'):
+          checkpoint_dir='checkpoints', val_loader_source=None):
+    """
+    Train function supporting dual validation (Target & Source).
+    """
     data_type = config['data'].get('type', 'nyuv2').lower()
     train_cfg = config['training']
 
@@ -300,6 +324,11 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
     target_ind_lambda = float(config['losses'].get('lambda_independence', 0.0))
 
     best_relative_score = -float('inf')
+
+    # [NEW] 记录源域最佳分数和指标
+    best_score_src = -float('inf')
+    best_metrics_src = {}
+
     baseline_metrics = None
     best_epoch = 0
     best_metrics_details = {}
@@ -359,7 +388,6 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
         logging.info(f"\n----- Epoch {epoch + 1}/{total_epochs} (Stage {stage}) | lr={cur_lr:.6f} -----")
 
         # --- Train & Validate ---
-        # [MODIFIED] 这里传入了 config 以启用 CFA 配置读取
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, stage=stage,
                                      config=config)
         val_metrics = evaluate(model, val_loader, criterion, device, stage=stage, data_type=data_type)
@@ -371,7 +399,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
         else:
             sched["step"].step()
 
-        # --- Best Model Selection (Fixed Baseline Logic) ---
+        # --- Best Model Selection (Fixed Baseline Logic for Target Domain) ---
         is_best = False
         score = 0.0
 
@@ -427,4 +455,33 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
                 logging.info("  -> Warning: No baseline found (resumed?), setting current as baseline.")
                 baseline_metrics = val_metrics
 
+        # [NEW] Source Domain Validation Support (Dual Validation)
+        # 仅当传入 val_loader_source 时执行，且不干扰原有的 best selection 逻辑
+        if val_loader_source is not None:
+            logging.info(f"🔍 [Val - Source] Evaluating on Source (GTA5)...")
+            # 强制传入 'gta5' 类型以确保 evaluator 使用正确的指标处理逻辑
+            val_metrics_src = evaluate(model, val_loader_source, criterion, device, stage=stage, data_type='gta5')
+
+            # 只在 Stage 2 (联合训练) 开始记录最佳模型，避免预训练阶段的干扰
+            if stage >= 2:
+                current_score_src = val_metrics_src.get('seg_miou', 0.0)
+                if current_score_src > best_score_src:
+                    best_score_src = current_score_src
+                    best_metrics_src = val_metrics_src.copy()  # [Modified] 记录完整指标以便最后打印
+                    logging.info(f"  ★ [Source Best] New Best GTA5 mIoU: {best_score_src:.4f}")
+
+                    # 保存为独立的文件，不覆盖 model_best.pth.tar
+                    save_checkpoint({
+                        'epoch': epoch + 1,
+                        'state_dict': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'best_score': best_score_src,
+                        'metrics': val_metrics_src
+                    }, False, checkpoint_dir=checkpoint_dir, filename='model_best_gta5.pth.tar')
+
     logging.info(f"\n✅ Training Finished. Best Epoch: {best_epoch}, Score: {best_relative_score:.2%}")
+    if val_loader_source is not None:
+        # [Modified] 打印最优 GTA5 的 mIoU 和 Pixel Acc
+        final_src_miou = best_metrics_src.get('seg_miou', 0.0)
+        final_src_acc = best_metrics_src.get('seg_pixel_acc', 0.0)
+        logging.info(f"   Best GTA5 Result -> mIoU: {final_src_miou:.4f} | Pixel Acc: {final_src_acc:.4f}")

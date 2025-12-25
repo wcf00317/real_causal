@@ -24,7 +24,7 @@ from utils.general_utils import set_seed, setup_logging
 
 def main(config_path):
     """
-    项目主函数（极简纯净版 - 仅支持 CausalMTLModel）。
+    项目主函数（支持双验证集 Dual Validation）。
     """
     # 1. 加载配置并设置随机种子
     try:
@@ -62,25 +62,48 @@ def main(config_path):
         dataset_path = data_cfg.get('dataset_path')
 
         logging.info(f"📋 Dataset Type: {dataset_type}")
-        logging.info(f"📂 Dataset Path: {dataset_path}")
+
+        # 初始化变量
+        train_dataset = None
+        val_dataset_tgt = None  # 目标域验证集 (Target)
+        val_dataset_src = None  # 源域验证集 (Source) - 可选
 
         # === 数据集加载逻辑 ===
         if dataset_type == 'gta5_to_cityscapes':
-            train_path = data_cfg['train_dataset_path']
-            val_path = data_cfg['val_dataset_path']
-            train_dataset = GTA5Dataset(root_dir=train_path, img_size=img_size)
-            val_dataset = CityscapesDataset(root_dir=val_path, split='val')
+            logging.info("🌍 Mode: GTA5 -> Cityscapes (Dual Validation)")
+
+            # 1. 训练集 (GTA5 Train) - 开启增强
+            train_dataset = GTA5Dataset(
+                root_dir=data_cfg['train_dataset_path'],
+                img_size=img_size,
+                augmentation=True  # <--- 训练开启增强
+            )
+
+            # 2. 目标域验证集 (Cityscapes Val)
+            val_dataset_tgt = CityscapesDataset(
+                root_dir=data_cfg['val_dataset_path'],
+                split='val'
+            )
+
+            # 3. 源域验证集 (GTA5 Val) - 关闭增强
+            # 只有在 config 中提供了 source_val_path 才加载
+            if 'source_val_path' in data_cfg:
+                val_dataset_src = GTA5Dataset(
+                    root_dir=data_cfg['source_val_path'],
+                    img_size=img_size,
+                    augmentation=False  # <--- 验证必须关闭增强
+                )
 
         elif dataset_type == 'cityscapes':
             logging.info("🌍 Mode: Cityscapes")
             train_dataset = CityscapesDataset(root_dir=dataset_path, split='train')
-            val_dataset = CityscapesDataset(root_dir=dataset_path, split='val')
+            val_dataset_tgt = CityscapesDataset(root_dir=dataset_path, split='val')
 
         elif dataset_type == 'nyuv2':
             logging.info("🏠 Mode: NYUv2")
             train_dataset = NYUv2Dataset(root_dir=dataset_path, mode='train',
                                          augmentation=data_cfg.get('augmentation', False))
-            val_dataset = NYUv2Dataset(root_dir=dataset_path, mode='val')
+            val_dataset_tgt = NYUv2Dataset(root_dir=dataset_path, mode='val')
 
         else:
             raise ValueError(f"❌ Unsupported dataset type: '{dataset_type}'")
@@ -88,6 +111,7 @@ def main(config_path):
         # DataLoader 设置
         pin_memory = data_cfg.get('pin_memory', torch.cuda.is_available())
 
+        # 训练 Loader
         train_loader = DataLoader(
             train_dataset,
             batch_size=data_cfg['batch_size'],
@@ -97,15 +121,28 @@ def main(config_path):
             drop_last=True
         )
 
-        val_loader = DataLoader(
-            val_dataset,
+        # 目标域验证 Loader (默认)
+        val_loader_tgt = DataLoader(
+            val_dataset_tgt,
             batch_size=data_cfg['batch_size'],
             shuffle=False,
             num_workers=data_cfg['num_workers'],
             pin_memory=pin_memory
         )
 
-        logging.info(f"📚 Dataset loaded: {len(train_dataset)} training, {len(val_dataset)} validation samples.")
+        # 源域验证 Loader (可选)
+        val_loader_src = None
+        if val_dataset_src is not None:
+            val_loader_src = DataLoader(
+                val_dataset_src,
+                batch_size=data_cfg['batch_size'],
+                shuffle=False,
+                num_workers=data_cfg['num_workers'],
+                pin_memory=pin_memory
+            )
+            logging.info(f"📚 Dual Validation Enabled: Source (GTA5) & Target (Cityscapes)")
+
+        logging.info(f"📚 Dataset loaded: {len(train_dataset)} training, {len(val_dataset_tgt)} target val samples.")
 
     except Exception as e:
         logging.info(f"❌ Error creating dataset/loaders: {e}")
@@ -117,7 +154,7 @@ def main(config_path):
     logging.info("\nInitializing CausalMTLModel...")
     base_lr = float(config['training']['learning_rate'])
 
-    # 直接实例化 CausalMTLModel，不再进行类型判断
+    # 直接实例化 CausalMTLModel
     model = CausalMTLModel(config['model'], config['data']).to(device)
 
     # 参数分组：Backbone vs Heads
@@ -147,7 +184,19 @@ def main(config_path):
     # 6. 启动训练
     logging.info("\n----- Starting Training -----")
     if config['training'].get('enable_training', True):
-        train(model, train_loader, val_loader, optimizer, criterion, scheduler, config, device, checkpoint_dir)
+        # 注意：这里传递了两个验证 Loader
+        train(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader_tgt,  # 目标域 (Cityscapes)
+            optimizer=optimizer,
+            criterion=criterion,
+            scheduler=scheduler,
+            config=config,
+            device=device,
+            checkpoint_dir=checkpoint_dir,
+            val_loader_source=val_loader_src  # 源域 (GTA5) - 可选
+        )
     else:
         logging.info("🏃 Training is disabled in config.")
 
@@ -156,21 +205,21 @@ def main(config_path):
     if exp_cfg.get('enable', False):
         logging.info("\n===== Running experiments =====")
         model.eval()
-        run_all_experiments(model, val_loader, device)
+        run_all_experiments(model, val_loader_tgt, device)
 
-    # 8. 可视化
+    # 8. 可视化 (使用目标域数据)
     logging.info("\n----- Running Final Visualizations -----")
     best_ckpt = os.path.join(checkpoint_dir, 'model_best.pth.tar')
     if os.path.exists(best_ckpt):
         try:
             checkpoint = torch.load(best_ckpt, map_location=device)
             model.load_state_dict(checkpoint['state_dict'], strict=False)
-            generate_visual_reports(model, val_loader, device, save_dir=vis_dir, num_reports=3)
+            generate_visual_reports(model, val_loader_tgt, device, save_dir=vis_dir, num_reports=3)
         except Exception as e:
             logging.info(f"⚠️ Visualization failed: {e}")
 
     if hasattr(train_dataset, "close"): train_dataset.close()
-    if hasattr(val_dataset, "close"): val_dataset.close()
+    if hasattr(val_dataset_tgt, "close"): val_dataset_tgt.close()
 
     logging.info("\n🎉 Done.")
 
