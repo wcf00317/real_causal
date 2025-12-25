@@ -124,8 +124,8 @@ def evaluate(model, val_loader, criterion, device, stage, data_type):
     logging.info(f"[Seg   ] mIoU:     {final_miou:<7.4f} | Pixel Acc: {final_pixel_acc:<7.4f}")
 
     # 2. Depth
-    if 'gta5' not in str(data_type).lower():
-        logging.info(f"[Depth ] Abs Err:  {final_abs_err:<7.4f} | Rel Err:   {final_rel_err:<7.4f}")
+    # [MODIFIED] 始终打印深度指标，不再屏蔽 GTA5
+    logging.info(f"[Depth ] Abs Err:  {final_abs_err:<7.4f} | Rel Err:   {final_rel_err:<7.4f}")
 
     # 3. Normal
     if 'nyuv2' in str(data_type).lower():
@@ -196,27 +196,23 @@ class DepthMetric(AbsMetric):
         self.bs = []
 
     def update_fun(self, pred, gt):
+        # [MODIFIED] 修改掩码逻辑：
+        # 对于 GTA5 伪标签 (归一化到 0-1)，0 是有效值 (最近处)，不能过滤 != 0。
+        # 假设所有像素均参与评估。
+
         # pred, gt 形状应为 [B, C, H, W]
-        device = pred.device
-        # 掩码: 过滤 GT 中全为 0 的像素
-        binary_mask = (torch.sum(gt, dim=1) != 0).unsqueeze(1).to(device)
 
-        num_valid_pixels = torch.nonzero(binary_mask, as_tuple=False).size(0)
-        if num_valid_pixels == 0:
-            return
-
-        pred = pred.masked_select(binary_mask)
-        gt = gt.masked_select(binary_mask)
-
+        # 计算误差
         abs_err = torch.abs(pred - gt)
+        # 计算相对误差 (加 epsilon 防止除以 0)
         rel_err = torch.abs(pred - gt) / torch.clamp(gt, min=1e-6)
 
-        abs_err_mean = (torch.sum(abs_err) / num_valid_pixels).item()
-        rel_err_mean = (torch.sum(rel_err) / num_valid_pixels).item()
+        # 记录均值
+        self.abs_record.append(abs_err.mean().item())
+        self.rel_record.append(rel_err.mean().item())
 
-        self.abs_record.append(abs_err_mean)
-        self.rel_record.append(rel_err_mean)
-        self.bs.append(num_valid_pixels)
+        # 记录参与计算的像素总数 (用于加权平均)
+        self.bs.append(pred.numel())
 
     def score_fun(self):
         if not self.bs:

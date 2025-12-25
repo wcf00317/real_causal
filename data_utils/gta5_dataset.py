@@ -15,15 +15,17 @@ GTA5_TO_7_CLASSES = {
     28: 6, 29: -1, 30: -1, 31: 6, 32: 6, 33: 6
 }
 
+
 class GTA5Dataset(Dataset):
     def __init__(self, root_dir, img_size, augmentation=False):
         """
         新增 augmentation 参数控制是否翻转
+        支持读取同级目录下的 depth (.npy) 信息
         """
         super().__init__()
         self.root_dir = root_dir
         self.img_size = img_size
-        self.augmentation = augmentation  # <--- 新增
+        self.augmentation = augmentation
 
         self.images_dir = os.path.join(root_dir, 'images')
         if not os.path.exists(self.images_dir):
@@ -33,21 +35,34 @@ class GTA5Dataset(Dataset):
         if not os.path.exists(self.labels_dir):
             self.labels_dir = os.path.join(root_dir, 'Labels')
 
+        # 1. 自动定位 depth 文件夹
+        self.depth_dir = os.path.join(root_dir, 'depth')
+
         self.images = []
         self.targets = []
+        self.depths = []  # 存储深度路径
 
         search_pattern = os.path.join(self.images_dir, "*.png")
         files = glob.glob(search_pattern)
+        files.sort()  # 排序，确保图像顺序一致
 
         for img_path in files:
             file_name = os.path.basename(img_path)
             label_path = os.path.join(self.labels_dir, file_name)
+
+            # 2. 构造深度文件路径 (假设 0001.png -> 0001.npy)
+            depth_file_name = os.path.splitext(file_name)[0] + '.npy'
+            depth_path = os.path.join(self.depth_dir, depth_file_name)
+
             if os.path.exists(label_path):
                 self.images.append(img_path)
                 self.targets.append(label_path)
 
-        self.images.sort()
-        self.targets.sort()
+                # 如果对应的深度文件存在，则记录；否则给None
+                if os.path.exists(depth_path):
+                    self.depths.append(depth_path)
+                else:
+                    self.depths.append(None)
 
         self.mapping = np.zeros(256, dtype=np.int64) - 1
         for k, v in GTA5_TO_7_CLASSES.items():
@@ -55,6 +70,7 @@ class GTA5Dataset(Dataset):
                 self.mapping[k] = v
 
         print(f"[GTA5] Found {len(self.images)} samples in {root_dir} (Aug={self.augmentation})")
+        print(f"[GTA5] Depth samples found: {len([d for d in self.depths if d is not None])}")
 
     def __len__(self):
         return len(self.images)
@@ -62,19 +78,46 @@ class GTA5Dataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.images[idx]
         label_path = self.targets[idx]
+        depth_path = self.depths[idx]
 
         img = Image.open(img_path).convert('RGB')
         label = Image.open(label_path)
 
-        # Resize
-        img = img.resize((self.img_size[1], self.img_size[0]), Image.BILINEAR)
-        label = label.resize((self.img_size[1], self.img_size[0]), Image.NEAREST)
+        # 3. 读取深度信息并归一化
+        if depth_path is not None:
+            # 读取 .npy (float32, 0~255)
+            depth_np = np.load(depth_path).astype(np.float32)
 
-        # Augmentation (仅在 augmentation=True 时执行)
+            # 归一化到 [0, 1] (Instance Normalization)
+            # 这样可以消除 "绝对数值" 的影响，只保留 "相对结构"
+            d_min = depth_np.min()
+            d_max = depth_np.max()
+            if d_max - d_min > 1e-5:
+                depth_np = (depth_np - d_min) / (d_max - d_min)
+            else:
+                depth_np = np.zeros_like(depth_np)
+
+            # 转为 PIL 'F' 模式以便进行几何变换 (PIL 'F' 对应 float32)
+            depth_img = Image.fromarray(depth_np, mode='F')
+        else:
+            # 如果缺失深度，生成全0图
+            depth_img = Image.fromarray(np.zeros((img.size[1], img.size[0]), dtype=np.float32), mode='F')
+
+        # 4. Resize (保持一致)
+        # resize 接受 (width, height)
+        target_size = (self.img_size[1], self.img_size[0])
+
+        img = img.resize(target_size, Image.BILINEAR)
+        label = label.resize(target_size, Image.NEAREST)
+        depth_img = depth_img.resize(target_size, Image.BILINEAR)  # 深度图用双线性插值
+
+        # 5. Augmentation (同步翻转)
         if self.augmentation and random.random() < 0.5:
             img = transforms.functional.hflip(img)
             label = transforms.functional.hflip(label)
+            depth_img = transforms.functional.hflip(depth_img)
 
+        # 6. 转 Tensor
         to_tensor = transforms.ToTensor()
         rgb_tensor_unnormalized = to_tensor(img).float()
 
@@ -83,7 +126,9 @@ class GTA5Dataset(Dataset):
         label_mapped = self.mapping[label_np]
         seg_tensor = torch.from_numpy(label_mapped).long()
 
-        depth_tensor = torch.zeros((1, self.img_size[1], self.img_size[0]), dtype=torch.float32)
+        # Depth Tensor [1, H, W]
+        # 因为已经是 float32 且归一化到了 0-1，ToTensor 直接转换即可
+        depth_tensor = to_tensor(depth_img).float()
 
         return {
             'rgb': rgb_tensor_unnormalized,

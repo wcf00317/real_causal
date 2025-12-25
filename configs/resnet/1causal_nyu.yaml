@@ -1,7 +1,7 @@
 data:
   type: "nyuv2"
   dataset_path: "../mtl_dataset/nyuv2"
-  batch_size: 32   # 如果显存允许，尽量开大
+  batch_size: 16   # 如果显存允许，尽量开大
   num_workers: 4
   img_size: [288, 384]
   augmentation: True

@@ -34,16 +34,16 @@ model:
       grayscale_prior: true
 
 training:
-  seed: 42
+  seed: 2024
   epochs: 100
   optimizer: "AdamW"
-  learning_rate: 0.0001 # 迁移学习通常 LR 较小
-  weight_decay: 0.0005
+  learning_rate: 0.0002 # 迁移学习通常 LR 较小
+  weight_decay: 0.0001
 
   # 阶段控制
-  stage0_epochs: 5      # 预热分解
+  stage0_epochs: 10      # 预热分解
   stage1_epochs: 5      # 预热任务头
-  ind_warmup_epochs: 50 # 10 epoch 后开启独立性约束
+  ind_warmup_epochs: 20 # 10 epoch 后开启独立性约束
 
   lr_scheduler:
     type: "cosine"
@@ -53,36 +53,35 @@ training:
   # 【反事实增强】 Sim-to-Real 的核心，建议开启
   cfa:
     enabled: true
-    start_epoch: 60
+    start_epoch: 50
     prob: 0.5
     lambda_cfa: 1.0
-    cka_threshold: 0.2
     mix_strategy: "global"
 
 losses:
   # === 任务 Loss ===
-  lambda_seg: 50.0
+  lambda_seg: 10.0
 
-  # 【关键】GTA5 没有深度真值，必须设为 0，否则模型会崩塌
-  lambda_depth: 0.0
+
+  lambda_depth: 20.0
 
   lambda_normal: 0.0 # 除非您有 GTA5 的法线真值，否则也设为 0
   lambda_edge_consistency: 0.0
 
   # === 独立性 Loss ===
-  lambda_independence: 0.5 # 稍微降低，因为跨域很难完全解耦
+  lambda_independence: 0.1 # 稍微降低，因为跨域很难完全解耦
 
   # === 重构 Loss ===
   # 即使没有深度监督，也可以尝试无监督的几何重构约束（如果有辅助Loss支持），
   # 但稳妥起见，若无深度真值，建议降低或关闭几何重构权重
-  alpha_recon_geom: 0.0
+  alpha_recon_geom: 2.0
 
-  # 外观重构必须保留
-  beta_recon_app: 0.1
-  lambda_l1_recon: 1.0
+  # 图像重构 (A*S = I) 是无监督分解的唯一动力
+  beta_recon_app: 5.0  # 加大权重，因为没有法线监督，重构是唯一的约束
+  lambda_l1_recon: 2.0
 
-  # === 物理分解约束 ===
-  lambda_img: 1.0
-  lambda_alb_tv: 0.1
-  lambda_sh_gray: 0.1
-  lambda_xcov: 0.1
+  # === 4. 物理先验 ===
+  lambda_img: 5.0      # 物理渲染重构权重
+  lambda_alb_tv: 0.1   # 纹理平滑
+  lambda_sh_gray: 0.1  # 光照约束
+  lambda_xcov: 0.5     # 去相关

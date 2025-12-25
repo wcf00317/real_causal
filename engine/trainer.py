@@ -110,7 +110,7 @@ def calculate_improvement(base_metrics, current_metrics, data_type='nyuv2'):
     # 根据数据集类型过滤有效指标
     valid_keys = set(metric_meta.keys())
     if 'gta5' in data_type:
-        valid_keys = {'seg_miou', 'seg_pixel_acc'}
+        valid_keys = {'seg_miou', 'seg_pixel_acc', 'depth_abs_err', 'depth_rel_err'}
     elif data_type == 'cityscapes':
         valid_keys = {'seg_miou', 'seg_pixel_acc', 'depth_abs_err', 'depth_rel_err'}
 
@@ -158,7 +158,7 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, st
 
         # [Rule 2] 只有开启时才检查参数，且不允许缺省
         if cfa_enabled:
-            required_params = ['start_epoch', 'cka_threshold', 'prob', 'lambda_cfa', 'mix_strategy']
+            required_params = ['start_epoch', 'prob', 'lambda_cfa', 'mix_strategy']
             missing_params = [k for k in required_params if k not in cfa_cfg]
 
             if missing_params:
@@ -169,7 +169,6 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, st
 
             # 安全读取 (既然通过了上面的检查，这里一定有值)
             cfa_start_epoch = cfa_cfg['start_epoch']
-            cfa_cka_thresh = cfa_cfg['cka_threshold']
             cfa_prob = cfa_cfg['prob']
             lambda_cfa = cfa_cfg['lambda_cfa']
             cfa_mix_strategy = cfa_cfg['mix_strategy']
@@ -224,10 +223,9 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, st
         # 只有当 cfa_enabled 为 True 时，这些变量才会被定义，所以这里是安全的
         if cfa_enabled:
             cond_epoch = epoch >= cfa_start_epoch
-            cond_cka = current_cka < cfa_cka_thresh
             cond_batch = rgb.size(0) > 1
 
-            should_run_cfa = cond_stage and cond_epoch and cond_cka and cond_batch
+            should_run_cfa = cond_stage and cond_epoch and cond_batch
 
             if should_run_cfa and (torch.rand(1).item() < cfa_prob):
                 cfa_active = True
@@ -287,7 +285,9 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, st
         # Update Pbar
         pf = {
             'L': f"{loss_main.item():.2f}",
-            'CKA': f"{current_cka:.2f}"
+            'Seg': f"{loss_dict.get('seg_loss', 0):.4f}",  # 新增
+            'Dep': f"{loss_dict.get('depth_loss', 0):.4f}",  # 新增
+            'CKA': f"{current_cka:.4f}"
         }
         if cfa_active:
             pf['CFA'] = f"{loss_cfa_val:.2f}"
@@ -331,7 +331,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
 
     baseline_metrics = None
     best_epoch = 0
-    best_metrics_details = {}
+    baseline_metrics_src = None
 
     # [NEW] 计算 Stage 2 正式开始的 Epoch 索引
     stage2_start_epoch = stage0_epochs + stage1_epochs
@@ -456,32 +456,57 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
                 baseline_metrics = val_metrics
 
         # [NEW] Source Domain Validation Support (Dual Validation)
-        # 仅当传入 val_loader_source 时执行，且不干扰原有的 best selection 逻辑
         if val_loader_source is not None:
             logging.info(f"🔍 [Val - Source] Evaluating on Source (GTA5)...")
-            # 强制传入 'gta5' 类型以确保 evaluator 使用正确的指标处理逻辑
+
+            # 1. 评估 (Evaluate)
+            # 强制传入 'gta5'，evaluator 会输出 seg_miou, seg_pixel_acc, depth_abs_err, depth_rel_err
             val_metrics_src = evaluate(model, val_loader_source, criterion, device, stage=stage, data_type='gta5')
 
-            # 只在 Stage 2 (联合训练) 开始记录最佳模型，避免预训练阶段的干扰
+            # 2. Stage 2 (联合训练) 评判逻辑 - 与 Target Domain 保持一致
             if stage >= 2:
-                current_score_src = val_metrics_src.get('seg_miou', 0.0)
-                if current_score_src > best_score_src:
-                    best_score_src = current_score_src
-                    best_metrics_src = val_metrics_src.copy()  # [Modified] 记录完整指标以便最后打印
-                    logging.info(f"  ★ [Source Best] New Best GTA5 mIoU: {best_score_src:.4f}")
+                # A. 锁定 Baseline (如果是 Stage 2 第一轮，或者断点续训刚开始)
+                if epoch == stage2_start_epoch or baseline_metrics_src is None:
+                    baseline_metrics_src = val_metrics_src
+                    logging.info(f"  -> 🏁 [Source] Stage 2 Started. Setting FIXED BASELINE from current epoch.")
 
-                    # 保存为独立的文件，不覆盖 model_best.pth.tar
+                # B. 计算综合得分 (Score)
+                # calculate_improvement 会自动识别 dict 里的 key:
+                # + seg_miou (越大越好)
+                # - depth_abs_err (越小越好)
+                # Score > 0 表示整体比 Baseline 好
+                score_src = calculate_improvement(baseline_metrics_src, val_metrics_src, data_type='gta5')
+
+                # C. 记录最佳模型 (根据综合 Score)
+                if score_src > best_score_src:
+                    best_score_src = score_src
+                    best_metrics_src = val_metrics_src.copy()
+
+                    # 准备日志数据
+                    cur_miou = val_metrics_src.get('seg_miou', 0.0)
+                    cur_depth = val_metrics_src.get('depth_abs_err', 0.0)
+
+                    logging.info(
+                        f"  ★ [Source Best] New Best (Score: {best_score_src:.2%}) | mIoU: {cur_miou:.4f} | Depth Abs: {cur_depth:.4f}")
+
+                    # 保存为独立文件
                     save_checkpoint({
                         'epoch': epoch + 1,
                         'state_dict': model.state_dict(),
                         'optimizer': optimizer.state_dict(),
                         'best_score': best_score_src,
-                        'metrics': val_metrics_src
+                        'metrics': val_metrics_src,
+                        'baseline_metrics': baseline_metrics_src  # 把 Baseline 也存进去，方便续训
                     }, False, checkpoint_dir=checkpoint_dir, filename='model_best_gta5.pth.tar')
 
     logging.info(f"\n✅ Training Finished. Best Epoch: {best_epoch}, Score: {best_relative_score:.2%}")
+
     if val_loader_source is not None:
-        # [Modified] 打印最优 GTA5 的 mIoU 和 Pixel Acc
+        # [Modified] 打印最优 GTA5 的完整指标：mIoU, Pixel Acc, Abs Err, Rel Err
         final_src_miou = best_metrics_src.get('seg_miou', 0.0)
         final_src_acc = best_metrics_src.get('seg_pixel_acc', 0.0)
-        logging.info(f"   Best GTA5 Result -> mIoU: {final_src_miou:.4f} | Pixel Acc: {final_src_acc:.4f}")
+        final_src_depth_abs = best_metrics_src.get('depth_abs_err', 0.0)
+        final_src_depth_rel = best_metrics_src.get('depth_rel_err', 0.0)
+
+        logging.info(
+            f"   Best GTA5 Result -> mIoU: {final_src_miou:.4f} | Pixel Acc: {final_src_acc:.4f} | Depth Abs: {final_src_depth_abs:.4f} | Depth Rel: {final_src_depth_rel:.4f}")
