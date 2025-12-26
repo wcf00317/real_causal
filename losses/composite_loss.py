@@ -141,7 +141,7 @@ class CompositeLoss(nn.Module):
             # Depth (with mask)
             pred_d = outputs['pred_depth']
             gt_d = targets['depth']
-            mask = (gt_d >= 0).float().detach()
+            mask = (gt_d > 0).float().detach()
             num_valid = mask.sum()
             if num_valid > 0:
                 l_depth = (torch.abs(pred_d - gt_d) * mask).sum() / num_valid

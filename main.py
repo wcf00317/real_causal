@@ -63,9 +63,7 @@ def main(config_path):
 
         logging.info(f"📋 Dataset Type: {dataset_type}")
 
-        # 初始化变量
-        train_dataset = None
-        val_dataset_tgt = None  # 目标域验证集 (Target)
+
         val_dataset_src = None  # 源域验证集 (Source) - 可选
 
         # === 数据集加载逻辑 ===

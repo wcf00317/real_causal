@@ -388,9 +388,18 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
         logging.info(f"\n----- Epoch {epoch + 1}/{total_epochs} (Stage {stage}) | lr={cur_lr:.6f} -----")
 
         # --- Train & Validate ---
+        # 目标域
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, stage=stage,
                                      config=config)
-        val_metrics = evaluate(model, val_loader, criterion, device, stage=stage, data_type=data_type)
+        if data_type=="gta5_to_cityscapes":
+            val_metrics = evaluate(model, val_loader, criterion, device,
+                                   stage=stage, data_type="cityscapes",mask_zeros=True)
+        elif data_type=="cityscapes2cityscapes_c":
+            val_metrics = evaluate(model, val_loader, criterion, device,
+                                   stage=stage, data_type="cityscapes_c",mask_zeros=True)
+        else:
+            val_metrics = evaluate(model, val_loader, criterion, device,
+                                   stage=stage,data_type=data_type,mask_zeros=True)
 
         # --- Scheduler Step ---
         if sched["type"] == "cosine":
@@ -457,12 +466,17 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
 
         # [NEW] Source Domain Validation Support (Dual Validation)
         if val_loader_source is not None:
-            logging.info(f"🔍 [Val - Source] Evaluating on Source (GTA5)...")
+            if data_type=="gta5_to_cityscapes":
+                logging.info(f"🔍 [Val - Source] Evaluating on Source (GTA5)...")
 
             # 1. 评估 (Evaluate)
             # 强制传入 'gta5'，evaluator 会输出 seg_miou, seg_pixel_acc, depth_abs_err, depth_rel_err
-            val_metrics_src = evaluate(model, val_loader_source, criterion, device, stage=stage, data_type='gta5')
-
+                val_metrics_src = evaluate(model, val_loader_source, criterion, device,
+                                           stage=stage, data_type='gta5',mask_zeros=False)
+            elif data_type=="cityscapes2cityscapes_c":
+                logging.info(f"🔍 [Val - Source] Evaluating on Source (CITYSCAPES)...")
+                val_metrics_src = evaluate(model, val_loader_source, criterion, device,
+                                           stage=stage, data_type='cityscapes', mask_zeros=True)
             # 2. Stage 2 (联合训练) 评判逻辑 - 与 Target Domain 保持一致
             if stage >= 2:
                 # A. 锁定 Baseline (如果是 Stage 2 第一轮，或者断点续训刚开始)
@@ -482,13 +496,16 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
                     best_score_src = score_src
                     best_metrics_src = val_metrics_src.copy()
 
-                    # 准备日志数据
                     cur_miou = val_metrics_src.get('seg_miou', 0.0)
-                    cur_depth = val_metrics_src.get('depth_abs_err', 0.0)
+                    cur_acc = val_metrics_src.get('seg_pixel_acc', 0.0)  # 新增
+                    cur_depth_abs = val_metrics_src.get('depth_abs_err', 0.0)
+                    cur_depth_rel = val_metrics_src.get('depth_rel_err', 0.0)  # 新增
 
                     logging.info(
-                        f"  ★ [Source Best] New Best (Score: {best_score_src:.2%}) | mIoU: {cur_miou:.4f} | Depth Abs: {cur_depth:.4f}")
-
+                        f"  ★ [Source Best] New Best (Score: {best_score_src:.2%}) | "
+                        f"mIoU: {cur_miou:.4f} | Pixel Acc: {cur_acc:.4f} | "  # 打印 Seg 指标
+                        f"Depth Abs: {cur_depth_abs:.4f} | Depth Rel: {cur_depth_rel:.4f}"  # 打印 Depth 指标
+                    )
                     # 保存为独立文件
                     save_checkpoint({
                         'epoch': epoch + 1,
@@ -509,4 +526,4 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
         final_src_depth_rel = best_metrics_src.get('depth_rel_err', 0.0)
 
         logging.info(
-            f"   Best GTA5 Result -> mIoU: {final_src_miou:.4f} | Pixel Acc: {final_src_acc:.4f} | Depth Abs: {final_src_depth_abs:.4f} | Depth Rel: {final_src_depth_rel:.4f}")
+            f"   Best Source Result -> mIoU: {final_src_miou:.4f} | Pixel Acc: {final_src_acc:.4f} | Depth Abs: {final_src_depth_abs:.4f} | Depth Rel: {final_src_depth_rel:.4f}")

@@ -1,0 +1,95 @@
+data:
+  # === 关键修改：指定使用泛化测试模式 ===
+  # 这会触发 main.py 加载 CityscapesCDataset 作为验证集
+  type: "cityscapes_generalization"
+
+  # 1. 训练集 & 源域验证集 (Source: Cityscapes Clean)
+  # 这里指向包含 .npy (image/label/depth) 的预处理目录
+  train_dataset_path: "/data/chengfengwu/alrl/mtl_dataset/cityscape_preprocess"
+
+  # 2. 目标域验证集 (Target: Cityscapes-C)
+  # 这里指向 Cityscapes-C 的根目录 (包含 fog, noise 等文件夹)
+  cc_dataset_path: "/data/chengfengwu/alrl/mtl_dataset/Cityscapes-C"
+
+  # 3. 目标域 GT (Ground Truth)
+  # 指向预处理后的 .npy 目录。修正后的 CityscapesCDataset 会去这里找对应的 label/*.npy
+  original_gt_path: "/data/chengfengwu/alrl/mtl_dataset/cityscape_preprocess"
+
+  # 4. 指定具体的测试场景 (Corrupted Domain)
+  cc_corruption: "fog"       # 可选: fog, snow, gaussian_noise, pixelate 等
+  cc_severity: 5             # 严重程度: 1 - 5
+
+  # 其他常规参数
+  batch_size: 32
+  num_workers: 4
+  img_size: [128, 256] # 必须与你训练的 .npy 尺寸一致
+  pin_memory: true
+
+model:
+  type: "causal"
+  encoder_name: "resnet50"
+  pretrained: True
+
+  # === 核心结构参数 ===
+  # [注意] 保持为 7，因为你的 Cityscapes .npy 数据集似乎是 7 类设置
+  num_seg_classes: 7
+  latent_dim_s: 1024
+  latent_dim_p: 64
+  z_s_bottleneck_noise: 0.1
+
+  # 物理分解头
+  decomposition:
+    enabled: true
+    normal_head_hidden: 128
+    albedo_head_hidden: 128
+    light_head:
+      sh_degree: 2
+      grayscale_prior: true
+
+training:
+  seed: 2024
+  epochs: 100
+  optimizer: "AdamW"
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+
+  # === 阶段控制 ===
+  stage0_epochs: 10
+  stage1_epochs: 5
+  ind_warmup_epochs: 20
+
+  lr_scheduler:
+    type: "cosine"
+    warmup_epochs: 5
+    min_lr_factor: 0.01
+
+  # === CFA 反事实增强配置 ===
+  # [重要] 泛化任务建议开启！CFA 能帮助模型学习不依赖于特定风格(如雾天/噪声)的结构特征
+  cfa:
+    enabled: true       # <--- 泛化任务建议开启
+    start_epoch: 50     # 等特征稳定后再开启
+    cka_threshold: 0.1
+    prob: 0.5           # 50% 的概率进行增强
+    lambda_cfa: 1.0
+    mix_strategy: "global"
+
+losses:
+  # === 1. 下游任务 Loss ===
+  lambda_seg: 10.0
+  lambda_depth: 20.0
+  lambda_normal: 0.0    # Cityscapes 无法线 GT
+  lambda_edge_consistency: 0.1
+
+  # === 2. 独立性约束 ===
+  lambda_independence: 1.0
+
+  # === 3. 重构 Loss ===
+  alpha_recon_geom: 2.0
+  beta_recon_app: 5.0
+  lambda_l1_recon: 2.0
+
+  # === 4. 物理先验 ===
+  lambda_img: 5.0
+  lambda_alb_tv: 0.1
+  lambda_sh_gray: 0.1
+  lambda_xcov: 0.5

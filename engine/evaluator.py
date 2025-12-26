@@ -11,7 +11,7 @@ import numpy as np
 
 
 @torch.no_grad()
-def evaluate(model, val_loader, criterion, device, stage, data_type):
+def evaluate(model, val_loader, criterion, device, stage, data_type,mask_zeros):
     """
     评估模型，并返回所有任务及重构任务的指标。
     """
@@ -38,7 +38,7 @@ def evaluate(model, val_loader, criterion, device, stage, data_type):
         num_classes=num_seg_classes, average='micro', ignore_index=-1).to(device)
 
     # LibMTL 对齐指标
-    depth_metric = DepthMetric().to(device)
+    depth_metric = DepthMetric(mask_zeros=mask_zeros).to(device)
     normal_metric = NormalMetric().to(device)
 
     # --- 2. 跟踪损失 ---
@@ -189,30 +189,44 @@ class DepthMetric(AbsMetric):
     对齐 LibMTL 的 DepthMetric，计算 Abs Err (MAE) 和 Rel Err。
     """
 
-    def __init__(self):
+    def __init__(self,mask_zeros):
         super(DepthMetric, self).__init__()
         self.abs_record = []
         self.rel_record = []
         self.bs = []
+        self.mask_zeros=mask_zeros
 
     def update_fun(self, pred, gt):
-        # [MODIFIED] 修改掩码逻辑：
-        # 对于 GTA5 伪标签 (归一化到 0-1)，0 是有效值 (最近处)，不能过滤 != 0。
-        # 假设所有像素均参与评估。
+        # 1. 根据保存的策略生成 Mask
+        if self.mask_zeros:
+            # Cityscapes / NYUv2: 必须过滤 0 (通常 > 0.001)
+            valid_mask = (gt > 1e-3)
+        else:
+            # GTA5: 全图有效
+            valid_mask = torch.ones_like(gt, dtype=torch.bool)
 
-        # pred, gt 形状应为 [B, C, H, W]
+        # 全图无效则跳过
+        if valid_mask.sum() == 0:
+            return
 
-        # 计算误差
-        abs_err = torch.abs(pred - gt)
-        # 计算相对误差 (加 epsilon 防止除以 0)
-        rel_err = torch.abs(pred - gt) / torch.clamp(gt, min=1e-6)
+        # 2. 提取像素
+        p = pred[valid_mask]
+        g = gt[valid_mask]
 
-        # 记录均值
+        # 3. 计算误差
+        abs_err = torch.abs(p - g)
+
+        # 相对误差计算
+        if self.mask_zeros:
+            # 既然已经过滤了 > 1e-3，直接除 g 即可，绝对安全
+            rel_err = torch.abs(p - g) / g
+        else:
+            # GTA 模式下 g 可能为 0，必须 clamp 分母防止除 0
+            rel_err = torch.abs(p - g) / torch.clamp(g, min=1e-6)
+
         self.abs_record.append(abs_err.mean().item())
         self.rel_record.append(rel_err.mean().item())
-
-        # 记录参与计算的像素总数 (用于加权平均)
-        self.bs.append(pred.numel())
+        self.bs.append(p.numel())
 
     def score_fun(self):
         if not self.bs:
