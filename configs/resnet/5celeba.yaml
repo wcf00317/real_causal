@@ -24,7 +24,7 @@ model:
 
 training:
   seed: 2024
-  epochs: 30           # 分类任务收敛较快，30 epoch 通常足够
+  epochs: 50           # 分类任务收敛较快，30 epoch 通常足够
 
   # 优化器配置
   optimizer: "AdamW"

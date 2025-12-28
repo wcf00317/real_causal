@@ -10,14 +10,17 @@ from datetime import datetime
 from data_utils.nyuv2_dataset import NYUv2Dataset
 from data_utils.gta5_dataset import GTA5Dataset
 from data_utils.cityscapes_dataset import CityscapesDataset
+from data_utils.cityscapes_c_dataset import CityscapesCDataset
 
 # --- 模型与Loss导入 (仅保留 Causal 核心) ---
 from models.causal_model import CausalMTLModel
 from losses.composite_loss import CompositeLoss
 
+
 # --- 引擎工具导入 ---
 from engine.trainer import train
 from engine.visualizer import generate_visual_reports
+from engine.evaluator import evaluate
 from engine.experiments import run_all_experiments
 from utils.general_utils import set_seed, setup_logging
 

@@ -11,7 +11,7 @@ import numpy as np
 
 
 @torch.no_grad()
-def evaluate(model, val_loader, criterion, device, stage, data_type,mask_zeros):
+def evaluate(model, val_loader, criterion, device, stage, data_type):
     """
     评估模型，并返回所有任务及重构任务的指标。
     """
@@ -38,7 +38,7 @@ def evaluate(model, val_loader, criterion, device, stage, data_type,mask_zeros):
         num_classes=num_seg_classes, average='micro', ignore_index=-1).to(device)
 
     # LibMTL 对齐指标
-    depth_metric = DepthMetric(mask_zeros=mask_zeros).to(device)
+    depth_metric = DepthMetric().to(device)
     normal_metric = NormalMetric().to(device)
 
     # --- 2. 跟踪损失 ---
@@ -155,21 +155,15 @@ def evaluate(model, val_loader, criterion, device, stage, data_type,mask_zeros):
     }
 
 
-# ==========================================================
-# [NEW] LibMTL Aligned Metric Classes (for Depth & Normal)
-# ==========================================================
+
 
 class AbsMetric(object):
     """LibMTL AbsMetric 抽象基类"""
-
     def __init__(self):
         self.bs = []
 
     def update(self, *args):
         self.update_fun(*args)
-
-    def compute(self):
-        return self.score_fun()
 
     def to(self, device):
         return self
@@ -186,49 +180,36 @@ class AbsMetric(object):
 
 class DepthMetric(AbsMetric):
     """
-    对齐 LibMTL 的 DepthMetric，计算 Abs Err (MAE) 和 Rel Err。
+    深度评估指标
+    逻辑：固定过滤 gt <= 0 的像素 (gt > 0 为有效)
     """
-
-    def __init__(self,mask_zeros):
+    def __init__(self):
+        # 坚决不加 mask_zeros 参数
         super(DepthMetric, self).__init__()
         self.abs_record = []
         self.rel_record = []
         self.bs = []
-        self.mask_zeros=mask_zeros
 
     def update_fun(self, pred, gt):
-        # 1. 根据保存的策略生成 Mask
-        if self.mask_zeros:
-            # Cityscapes / NYUv2: 必须过滤 0 (通常 > 0.001)
-            valid_mask = (gt > 1e-3)
-        else:
-            # GTA5: 全图有效
-            valid_mask = torch.ones_like(gt, dtype=torch.bool)
+        # 您的逻辑：只保留 gt > 0 的区域
+        valid_mask = (gt > 0)
 
-        # 全图无效则跳过
         if valid_mask.sum() == 0:
             return
 
-        # 2. 提取像素
         p = pred[valid_mask]
         g = gt[valid_mask]
 
-        # 3. 计算误差
         abs_err = torch.abs(p - g)
-
-        # 相对误差计算
-        if self.mask_zeros:
-            # 既然已经过滤了 > 1e-3，直接除 g 即可，绝对安全
-            rel_err = torch.abs(p - g) / g
-        else:
-            # GTA 模式下 g 可能为 0，必须 clamp 分母防止除 0
-            rel_err = torch.abs(p - g) / torch.clamp(g, min=1e-6)
+        # 既然 > 0，直接除以 g
+        rel_err = torch.abs(p - g) / g
 
         self.abs_record.append(abs_err.mean().item())
         self.rel_record.append(rel_err.mean().item())
         self.bs.append(p.numel())
 
-    def score_fun(self):
+    def compute(self):
+        # 直接实现计算逻辑，解决报错
         if not self.bs:
             return [0.0, 0.0]
 
@@ -239,7 +220,6 @@ class DepthMetric(AbsMetric):
         if total_pixels == 0:
             return [0.0, 0.0]
 
-        # 计算加权平均 (误差 * 像素数 / 总像素数)
         weighted_abs_err = (records[0] * batch_size).sum() / total_pixels
         weighted_rel_err = (records[1] * batch_size).sum() / total_pixels
 
@@ -248,44 +228,35 @@ class DepthMetric(AbsMetric):
 
 class NormalMetric(AbsMetric):
     """
-    对齐 LibMTL 的 NormalMetric，计算角度误差指标。
+    法线评估指标
     """
-
     def __init__(self):
         super(NormalMetric, self).__init__()
-        self.record = []  # 记录所有有效像素的角度误差 (度)
+        self.record = []
 
     def update_fun(self, pred, gt):
-        # pred, gt 形状应为 [B, 3, H, W]
-
-        # 1. 法线归一化 (pred)
+        # pred 归一化
         pred = pred / torch.norm(pred, p=2, dim=1, keepdim=True)
 
-        # 2. 掩码
+        # 掩码：gt 非 0 向量
         binary_mask = (torch.sum(gt, dim=1) != 0)
 
-        # 3. 计算点积 (cos(theta))
         dot_product = torch.sum(pred * gt, 1).masked_select(binary_mask)
-
-        # 4. 角度误差 (acos(dot_product))
         error_rad = torch.acos(torch.clamp(dot_product, -1, 1))
-
-        # 转换为角度 (度)
         error_deg = torch.rad2deg(error_rad).detach().cpu().numpy()
 
         self.record.append(error_deg)
 
-    def score_fun(self):
+    def compute(self):
+        # 直接实现计算逻辑
         if not self.record:
             return [0.0, 0.0, 0.0, 0.0, 0.0]
 
         records = np.concatenate(self.record)
 
-        # 5. 计算指标
         mean_angle = np.mean(records)
         median_angle = np.median(records)
 
-        # 准确率 (Acc@T)
         acc_11 = np.mean((records < 11.25) * 1.0)
         acc_22 = np.mean((records < 22.5) * 1.0)
         acc_30 = np.mean((records < 30) * 1.0)

@@ -1,7 +1,7 @@
 data:
   # === 关键修改：指定使用泛化测试模式 ===
   # 这会触发 main.py 加载 CityscapesCDataset 作为验证集
-  type: "cityscapes_generalization"
+  type: "cityscapes2cityscapes_c"
 
   # 1. 训练集 & 源域验证集 (Source: Cityscapes Clean)
   # 这里指向包含 .npy (image/label/depth) 的预处理目录
@@ -9,18 +9,16 @@ data:
 
   # 2. 目标域验证集 (Target: Cityscapes-C)
   # 这里指向 Cityscapes-C 的根目录 (包含 fog, noise 等文件夹)
-  cc_dataset_path: "/data/chengfengwu/alrl/mtl_dataset/Cityscapes-C"
+  cc_dataset_path: "/data/chengfengwu/alrl/mtl_dataset/cityscapes_c"
 
   # 3. 目标域 GT (Ground Truth)
   # 指向预处理后的 .npy 目录。修正后的 CityscapesCDataset 会去这里找对应的 label/*.npy
   original_gt_path: "/data/chengfengwu/alrl/mtl_dataset/cityscape_preprocess"
 
-  # 4. 指定具体的测试场景 (Corrupted Domain)
-  cc_corruption: "fog"       # 可选: fog, snow, gaussian_noise, pixelate 等
-  cc_severity: 5             # 严重程度: 1 - 5
+
 
   # 其他常规参数
-  batch_size: 32
+  batch_size: 16
   num_workers: 4
   img_size: [128, 256] # 必须与你训练的 .npy 尺寸一致
   pin_memory: true
@@ -48,14 +46,14 @@ model:
 
 training:
   seed: 2024
-  epochs: 100
+  epochs: 100 #100
   optimizer: "AdamW"
   learning_rate: 0.0002
   weight_decay: 0.0001
 
   # === 阶段控制 ===
-  stage0_epochs: 10
-  stage1_epochs: 5
+  stage0_epochs: 10 #10
+  stage1_epochs: 5 #5
   ind_warmup_epochs: 20
 
   lr_scheduler:
@@ -67,7 +65,7 @@ training:
   # [重要] 泛化任务建议开启！CFA 能帮助模型学习不依赖于特定风格(如雾天/噪声)的结构特征
   cfa:
     enabled: true       # <--- 泛化任务建议开启
-    start_epoch: 50     # 等特征稳定后再开启
+    start_epoch: 1 #50     # 等特征稳定后再开启
     cka_threshold: 0.1
     prob: 0.5           # 50% 的概率进行增强
     lambda_cfa: 1.0

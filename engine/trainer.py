@@ -393,13 +393,10 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
                                      config=config)
         if data_type=="gta5_to_cityscapes":
             val_metrics = evaluate(model, val_loader, criterion, device,
-                                   stage=stage, data_type="cityscapes",mask_zeros=True)
-        elif data_type=="cityscapes2cityscapes_c":
-            val_metrics = evaluate(model, val_loader, criterion, device,
-                                   stage=stage, data_type="cityscapes_c",mask_zeros=True)
+                                   stage=stage, data_type="cityscapes")
         else:
             val_metrics = evaluate(model, val_loader, criterion, device,
-                                   stage=stage,data_type=data_type,mask_zeros=True)
+                                   stage=stage,data_type=data_type)
 
         # --- Scheduler Step ---
         if sched["type"] == "cosine":
@@ -422,7 +419,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'best_score': best_relative_score,
+                'best_score': best_relative_score,'config': config,
             }, False, checkpoint_dir=checkpoint_dir)
 
         else:
@@ -438,7 +435,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
                     'state_dict': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'best_score': 0.0,
-                    'baseline_metrics': baseline_metrics,
+                    'baseline_metrics': baseline_metrics,'config': config,
                 }, False, checkpoint_dir=checkpoint_dir, filename='checkpoint_stage2_start.pth.tar')
 
             elif baseline_metrics is not None:
@@ -457,7 +454,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
                     'state_dict': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'best_score': best_relative_score,
-                    'baseline_metrics': baseline_metrics,
+                    'baseline_metrics': baseline_metrics,'config': config,
                 }, is_best, checkpoint_dir=checkpoint_dir)
             else:
                 # 防御性代码：如果是断点续训且没加载到 baseline，以当前为准
@@ -472,12 +469,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
             # 1. 评估 (Evaluate)
             # 强制传入 'gta5'，evaluator 会输出 seg_miou, seg_pixel_acc, depth_abs_err, depth_rel_err
                 val_metrics_src = evaluate(model, val_loader_source, criterion, device,
-                                           stage=stage, data_type='gta5',mask_zeros=False)
-            elif data_type=="cityscapes2cityscapes_c":
-                logging.info(f"🔍 [Val - Source] Evaluating on Source (CITYSCAPES)...")
-                val_metrics_src = evaluate(model, val_loader_source, criterion, device,
-                                           stage=stage, data_type='cityscapes', mask_zeros=True)
-            # 2. Stage 2 (联合训练) 评判逻辑 - 与 Target Domain 保持一致
+                                           stage=stage, data_type='gta5')
             if stage >= 2:
                 # A. 锁定 Baseline (如果是 Stage 2 第一轮，或者断点续训刚开始)
                 if epoch == stage2_start_epoch or baseline_metrics_src is None:
@@ -513,7 +505,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
                         'optimizer': optimizer.state_dict(),
                         'best_score': best_score_src,
                         'metrics': val_metrics_src,
-                        'baseline_metrics': baseline_metrics_src  # 把 Baseline 也存进去，方便续训
+                        'baseline_metrics': baseline_metrics_src,'config': config,  # 把 Baseline 也存进去，方便续训
                     }, False, checkpoint_dir=checkpoint_dir, filename='model_best_gta5.pth.tar')
 
     logging.info(f"\n✅ Training Finished. Best Epoch: {best_epoch}, Score: {best_relative_score:.2%}")
