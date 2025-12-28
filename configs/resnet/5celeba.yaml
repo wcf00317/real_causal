@@ -1,0 +1,50 @@
+data:
+  # 数据集类型 (仅用于日志记录，实际逻辑由 main_celeba.py 决定)
+  type: "celeba"
+  # 你的数据集根目录 (包含 list_attr_celeba.txt 和 img_align_celeba 文件夹)
+  dataset_path: "/data/chengfengwu/alrl/mtl_dataset/celeba/"
+
+  # 训练参数
+  batch_size: 256      # ResNet18 很轻，建议开大 Batch Size 以稳定 CKA 计算
+  num_workers: 8       # 数据读取线程数
+  img_size: [128, 128] # CelebA 标准尺寸，也适合 ResNet18
+  pin_memory: true
+  num_attributes: 10
+
+model:
+  type: "causal_celeba"
+  pretrained: true     # 使用 ImageNet 预训练权重加速收敛
+
+  # 潜变量维度
+  latent_dim_s: 1024    # 语义/属性特征 (Z_s)
+  latent_dim_p: 64    # 风格/背景特征 (Z_p)
+
+  # 任务定义
+  num_attributes: 10   # CelebA 默认属性数
+
+training:
+  seed: 2024
+  epochs: 30           # 分类任务收敛较快，30 epoch 通常足够
+
+  # 优化器配置
+  optimizer: "AdamW"
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+
+  enable_training: true
+
+losses:
+  # === 1. 主任务 Loss (Attribute Classification) ===
+  # BCE With Logits
+  lambda_attr: 1.0
+
+  # === 2. 重构 Loss (Reconstruction) ===
+  # 迫使 Z_s 保留空间结构 (五官位置) 并让 Z_p 吸收背景纹理
+  # 建议权重设大一点，因为它是唯一的"无监督结构约束"
+  beta_recon_app: 5.0     # 总重构权重
+  lambda_l1_recon: 1.0    # L1 Loss 权重
+  enable_lpips: true      # 开启感知损失 (LPIPS)，对人脸清晰度至关重要
+
+  # === 3. 独立性 Loss (Independence) ===
+  # 剥离属性与风格的相关性 (CKA)
+  lambda_independence: 0.5

@@ -87,17 +87,8 @@ class GTA5Dataset(Dataset):
         if depth_path is not None:
             # 读取 .npy (float32, 0~255)
             depth_np = np.load(depth_path).astype(np.float32)
-
-            # 归一化到 [0, 1] (Instance Normalization)
-            # 这样可以消除 "绝对数值" 的影响，只保留 "相对结构"
-            d_min = depth_np.min()
-            d_max = depth_np.max()
-            if d_max - d_min > 1e-5:
-                depth_np = (depth_np - d_min) / (d_max - d_min)
-            else:
-                depth_np = np.zeros_like(depth_np)
-
-            # 转为 PIL 'F' 模式以便进行几何变换 (PIL 'F' 对应 float32)
+            # 转为 PIL 'F' 模式
+            depth_np = depth_np / 255.0
             depth_img = Image.fromarray(depth_np, mode='F')
         else:
             # 如果缺失深度，生成全0图
