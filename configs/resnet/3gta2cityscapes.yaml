@@ -35,25 +35,25 @@ model:
 
 training:
   seed: 2024
-  epochs: 100
+  epochs: 200
   optimizer: "AdamW"
   learning_rate: 0.0002 # 迁移学习通常 LR 较小
   weight_decay: 0.0001
 
   # 阶段控制
-  stage0_epochs: 10      # 预热分解
+  stage0_epochs: 20      # 预热分解
   stage1_epochs: 5      # 预热任务头
-  ind_warmup_epochs: 20 # 10 epoch 后开启独立性约束
+  ind_warmup_epochs: 50 # 10 epoch 后开启独立性约束
 
   lr_scheduler:
     type: "cosine"
-    warmup_epochs: 5
+    warmup_epochs: 10
     min_lr_factor: 0.01
 
   # 【反事实增强】 Sim-to-Real 的核心，建议开启
   cfa:
     enabled: true
-    start_epoch: 50
+    start_epoch: 100
     prob: 0.5
     lambda_cfa: 1.0
     mix_strategy: "global"
