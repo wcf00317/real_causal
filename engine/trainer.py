@@ -277,6 +277,16 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, st
             else:
                 logging.info(msg)
 
+        if i % 50 == 0:
+            logging.info(f"\n[Epoch {epoch + 1}][Iter {i}] 🔍 Loss Breakdown:")
+            logging.info(f"  > Task Seg   : {loss_dict.get('seg_loss', 0):.4f}")
+            logging.info(f"  > Task Depth : {loss_dict.get('depth_loss', 0):.4f}")
+            logging.info(f"  > Indep (CKA): {loss_dict.get('independence_loss', 0):.4f} (Raw Value)")
+            logging.info(f"  > Recon Geom : {loss_dict.get('recon_geom_loss', 0):.4f}")
+            logging.info(f"  > Recon App  : {loss_dict.get('recon_app_loss', 0):.4f}")
+            logging.info(f"  > Decomp L1  : {loss_dict.get('decomp_img', 0):.4f}")
+            logging.info(f"  > Total Loss : {loss_main.item():.4f}")
+
         if (i + 1) % accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             optimizer.step()

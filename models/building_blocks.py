@@ -8,6 +8,132 @@ import torchvision.models as models
 from torchvision.models.vision_transformer import VisionTransformer
 from torchvision.models import ResNet50_Weights
 
+
+# [在文件顶部 imports 下方添加]
+class AdaIN(nn.Module):
+    def __init__(self, style_dim, num_features):
+        super().__init__()
+        # 预测仿射参数 (Scale, Shift)
+        self.fc = nn.Linear(style_dim, num_features * 2)
+
+    def forward(self, x, style):
+        # style: [B, style_dim] -> [B, 2*C]
+        h = self.fc(style)
+        h = h.view(h.size(0), h.size(1), 1, 1)
+        gamma, beta = h.chunk(2, 1)
+
+        # Instance Norm
+        mean = x.mean(dim=[2, 3], keepdim=True)
+        std = x.std(dim=[2, 3], keepdim=True) + 1e-8
+
+        # Modulate: (x - mean)/std * (1+gamma) + beta
+        # 注意：这里用 (1+gamma) 是为了让初始状态接近 Identity，训练更稳定
+        return (x - mean) / std * (1 + gamma) + beta
+
+
+# [新增一个支持 Style 的 Block，放在 ResidualBlock 附近]
+class AdaINResidualBlock(nn.Module):
+    """
+    支持 AdaIN 的残差块：
+    Content (x) 来自上一层, Style (z_p) 来自全局向量
+    """
+
+    def __init__(self, in_channels, out_channels, style_dim):
+        super().__init__()
+        self.adain1 = AdaIN(style_dim, in_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+
+        self.adain2 = AdaIN(style_dim, out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+
+        self.relu = nn.ReLU(inplace=True)
+
+        # Shortcut
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+            )
+            self.upsample = True
+        else:
+            self.shortcut = nn.Identity()
+            self.upsample = False
+
+        # 如果需要上采样主路径
+        if self.upsample:
+            self.main_upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+
+    def forward(self, x, style):
+        # Main Path
+        # 1. AdaIN -> ReLU -> Upsample(if needed) -> Conv
+        out = self.adain1(x, style)
+        out = self.relu(out)
+        if self.upsample:
+            out = self.main_upsample(out)
+        out = self.conv1(out)
+
+        # 2. AdaIN -> ReLU -> Conv
+        out = self.adain2(out, style)
+        out = self.relu(out)
+        out = self.conv2(out)
+
+        # Shortcut Path
+        res = self.shortcut(x)
+
+        return out + res
+
+
+# [修改 ResNetDecoderWithDeepSupervision]
+class ResNetDecoderWithDeepSupervision(nn.Module):
+    def __init__(self, input_channels, output_channels, target_size=(224, 224), style_dim=0):
+        super().__init__()
+        self.target_size = target_size
+        self.style_dim = style_dim  # 新增参数
+
+        # 初始层只处理 Z_s
+        self.initial_conv = nn.Sequential(
+            nn.Conv2d(input_channels, 512, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm2d(512),
+            nn.ReLU(True)
+        )
+        self.attention = SelfAttention(512)
+
+        # 如果 style_dim > 0，说明是 Appearance Decoder，使用 AdaIN
+        # 如果 style_dim == 0，说明是 Geometry Decoder，使用标准 ResidualBlock
+
+        if style_dim > 0:
+            self.use_adain = True
+            self.res_block1 = AdaINResidualBlock(512, 256, style_dim)
+            self.res_block2 = AdaINResidualBlock(256, 128, style_dim)
+            self.res_block3 = AdaINResidualBlock(128, 64, style_dim)
+        else:
+            self.use_adain = False
+            self.res_block1 = ResidualBlock(512, 256)
+            self.res_block2 = ResidualBlock(256, 128)
+            self.res_block3 = ResidualBlock(128, 64)
+
+        self.aux_head = nn.Conv2d(128, output_channels, kernel_size=3, padding=1)
+        self.final_upsample = nn.Conv2d(64, output_channels, kernel_size=3, padding=1)
+
+    def forward(self, x, style=None):
+        # x: Z_s [B, C, H, W]
+        x = self.initial_conv(x)
+        x = self.attention(x)
+
+        if self.use_adain:
+            assert style is not None, "Appearance Decoder requires style vector!"
+            x = self.res_block1(x, style)
+            x_56 = self.res_block2(x, style)
+            out_aux = self.aux_head(x_56)
+            x_final = self.res_block3(x_56, style)
+        else:
+            x = self.res_block1(x)
+            x_56 = self.res_block2(x)
+            out_aux = self.aux_head(x_56)
+            x_final = self.res_block3(x_56)
+
+        out_final = self.final_upsample(x_final)
+        return out_final, out_aux
 class ViTEncoder(nn.Module):
     """
     A wrapper for the Vision Transformer to extract multi-scale patch token features.
@@ -298,59 +424,59 @@ class ResidualBlock(nn.Module):
         main = self.main_path(x)
         return self.relu(shortcut + main)
 
-
-class ResNetDecoderWithDeepSupervision(nn.Module):
-    """
-    使用残差块构建的解码器，并集成了深度监督功能。
-    """
-    def __init__(self, input_channels, output_channels, target_size=(224, 224)):
-        super().__init__()
-        self.target_size = target_size
-        start_size = target_size[0] // 16  # 224 / 16 = 14
-
-        # 初始层：将扁平的latent vector转换为14x14的特征图
-        self.initial_conv = nn.Sequential(
-            nn.Conv2d(input_channels, 512, kernel_size=3, padding=1, bias=False),
-            nn.InstanceNorm2d(512),
-            nn.ReLU(True)
-        )
-        self.start_size = start_size
-        self.attention = SelfAttention(512)
-        # 上采样模块 (ResNet blocks)
-        self.res_block1 = ResidualBlock(512, 256)  # 14x14 -> 28x28
-        self.res_block2 = ResidualBlock(256, 128)  # 28x28 -> 56x56
-
-
-
-        self.res_block3 = ResidualBlock(128, 64)   # 56x56 -> 112x112
-
-        # --- 深度监督分支 ---
-        # 从 56x56 的特征图 (self.res_block2的输出) 创建一个辅助预测
-        self.aux_head = nn.Conv2d(128, output_channels, kernel_size=3, padding=1)
-
-        # 主输出路径
-        self.final_upsample = nn.Sequential(
-            #nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), # 112x112 -> 224x224
-            nn.Conv2d(64, output_channels, kernel_size=3, padding=1)
-        )
-
-    def forward(self, x):
-        # 1. 初始上采样 (输入 x 是 48x48 的 z_s_map)
-        x = self.initial_conv(x)  # -> [B, 512, 48, 48]
-
-        # 【关键】在这里做 Attention，显存开销极小
-        x = self.attention(x)  # -> [B, 512, 48, 48]
-
-        # 2. 通过残差块
-        x = self.res_block1(x)  # -> [B, 256, 96, 96]
-        x_56 = self.res_block2(x)  # -> [B, 128, 192, 192] (这里就是你的 x_56)
-
-        # 3. 计算辅助输出 (旁路，不影响主路)
-        out_aux = self.aux_head(x_56)
-
-        # 4. 继续主路径
-        x_final = self.res_block3(x_56)  # -> [B, 64, 384, 384]
-        out_final = self.final_upsample(x_final)
-
-        # 5. 返回主输出和辅助输出
-        return out_final, out_aux
+#
+# class ResNetDecoderWithDeepSupervision(nn.Module):
+#     """
+#     使用残差块构建的解码器，并集成了深度监督功能。
+#     """
+#     def __init__(self, input_channels, output_channels, target_size=(224, 224)):
+#         super().__init__()
+#         self.target_size = target_size
+#         start_size = target_size[0] // 16  # 224 / 16 = 14
+#
+#         # 初始层：将扁平的latent vector转换为14x14的特征图
+#         self.initial_conv = nn.Sequential(
+#             nn.Conv2d(input_channels, 512, kernel_size=3, padding=1, bias=False),
+#             nn.InstanceNorm2d(512),
+#             nn.ReLU(True)
+#         )
+#         self.start_size = start_size
+#         self.attention = SelfAttention(512)
+#         # 上采样模块 (ResNet blocks)
+#         self.res_block1 = ResidualBlock(512, 256)  # 14x14 -> 28x28
+#         self.res_block2 = ResidualBlock(256, 128)  # 28x28 -> 56x56
+#
+#
+#
+#         self.res_block3 = ResidualBlock(128, 64)   # 56x56 -> 112x112
+#
+#         # --- 深度监督分支 ---
+#         # 从 56x56 的特征图 (self.res_block2的输出) 创建一个辅助预测
+#         self.aux_head = nn.Conv2d(128, output_channels, kernel_size=3, padding=1)
+#
+#         # 主输出路径
+#         self.final_upsample = nn.Sequential(
+#             #nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), # 112x112 -> 224x224
+#             nn.Conv2d(64, output_channels, kernel_size=3, padding=1)
+#         )
+#
+#     def forward(self, x):
+#         # 1. 初始上采样 (输入 x 是 48x48 的 z_s_map)
+#         x = self.initial_conv(x)  # -> [B, 512, 48, 48]
+#
+#         # 【关键】在这里做 Attention，显存开销极小
+#         x = self.attention(x)  # -> [B, 512, 48, 48]
+#
+#         # 2. 通过残差块
+#         x = self.res_block1(x)  # -> [B, 256, 96, 96]
+#         x_56 = self.res_block2(x)  # -> [B, 128, 192, 192] (这里就是你的 x_56)
+#
+#         # 3. 计算辅助输出 (旁路，不影响主路)
+#         out_aux = self.aux_head(x_56)
+#
+#         # 4. 继续主路径
+#         x_final = self.res_block3(x_56)  # -> [B, 64, 384, 384]
+#         out_final = self.final_upsample(x_final)
+#
+#         # 5. 返回主输出和辅助输出
+#         return out_final, out_aux

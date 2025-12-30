@@ -182,9 +182,16 @@ class CausalMTLModel(nn.Module):
 
         # 2. 图像重构: Z_s + Z_p -> Image
         self.decoder_app = ResNetDecoderWithDeepSupervision(
-            self.latent_dim_s + self.latent_dim_p,  # 拼接输入
-            3, tuple(data_config['img_size'])
+            self.latent_dim_s,  # Content Input Channel
+            3,
+            tuple(data_config['img_size']),
+            style_dim=self.latent_dim_p  # Style Input Channel
         )
+
+        # self.decoder_app = ResNetDecoderWithDeepSupervision(
+        #     self.latent_dim_s + self.latent_dim_p,  # 拼接输入
+        #     3, tuple(data_config['img_size'])
+        # )
         self.final_app_activation = nn.Sigmoid()
 
         # 3. 物理分解 (Explicit Decomposition)
@@ -213,61 +220,52 @@ class CausalMTLModel(nn.Module):
     # ======================================================
     # [NEW] CFA 核心组件：生成反事实图像 + 诊断信息
     # ======================================================
+    # [修复 models/causal_model.py 中的 generate_counterfactual_image]
     def generate_counterfactual_image(self, z_s_map, z_p_map, strategy='global'):
         """
-        生成反事实图像，并返回用于诊断的中间统计量。
+        生成反事实图像 (适配 AdaIN 版本)
         Args:
             z_s_map: [B, C_s, H, W] 当前 batch 的结构特征
-            z_p_map: [B, C_p, H, W] 当前 batch 的风格特征
-            strategy: 'global' (推荐) 强制 z_p 全局化，避免空间错位; 'spatial' 直接拼接
-        Returns:
-            I_cfa: [B, 3, H, W] 反事实图像
-            diagnostics: dict, 包含 norm, std 等统计量
+            z_p_map: [B, C_p, H, W] 当前 batch 的风格特征 (或者已经扩展过的 map)
         """
         B = z_s_map.size(0)
 
-        # 1. 随机打乱索引 (Shuffle)
+        # 1. 随机打乱索引 (Shuffle) 以获取“别人的风格”
         perm_idx = torch.randperm(B, device=z_s_map.device)
         z_p_shuffled = z_p_map[perm_idx]
 
-        # 2. 风格特征处理 (Global Pooling 强制抹除空间信息)
-        if strategy == 'global':
-            # [B, C, H, W] -> [B, C, 1, 1]
-            z_p_content = z_p_shuffled.mean(dim=[2, 3], keepdim=True)
-            # Broadcast 回 [B, C, H, W]
-            z_p_inject = z_p_content.expand_as(z_p_map)
-        else:
-            # 危险：直接拼接，可能导致空间错位
-            z_p_inject = z_p_shuffled
+        # 2. 准备 Style Vector (AdaIN 需要向量)
+        # 无论输入是 Map 还是 Vector，我们都将其处理为 [B, C] 向量
+        # 因为 AdaIN 解码器需要 style 参数为向量
+        z_p_vec_shuffled = F.adaptive_avg_pool2d(z_p_shuffled, (1, 1)).flatten(1)
 
-        # 3. 特征拼接 (The Frankenstein Feature)
-        z_mix = torch.cat([z_s_map, z_p_inject], dim=1)
+        # 3. 解码生成图像 (关键修改：不再拼接，而是传参)
+        # 旧代码: z_mix = torch.cat([...]); self.decoder_app(z_mix)  <-- 报错根源
+        # 新代码: 分别传入 Content 和 Style
+        recon_app_logits, _ = self.decoder_app(z_s_map, z_p_vec_shuffled)
 
-        # 4. 解码生成图像
-        recon_app_logits, _ = self.decoder_app(z_mix)
         I_cfa = self.final_app_activation(recon_app_logits)
 
         # =================================================
         # [诊断探针数据]
-        # 计算特征空间的偏移量，判断是否“掉出流形”
         # =================================================
         with torch.no_grad():
-            # 原始 z_s 的范数
             norm_zs = z_s_map.norm(p=2, dim=1).mean()
-            # 注入 z_p 的范数
-            norm_zp = z_p_inject.norm(p=2, dim=1).mean()
-            # 混合后特征的统计量 (如果极大或极小，说明分布崩了)
-            mix_mean = z_mix.mean()
-            mix_std = z_mix.std()
+            norm_zp = z_p_vec_shuffled.norm(p=2, dim=1).mean()
+            # 这里的 mix_std 仅作参考，记录一下 Zs 的稳定性
+            # (AdaIN 模式下没有显式的 z_mix 拼接特征了)
+            mix_std = z_s_map.std()
 
         diagnostics = {
             "norm_zs": norm_zs.item(),
             "norm_zp": norm_zp.item(),
-            "mix_mean": mix_mean.item(),
+            "mix_mean": 0.0,
             "mix_std": mix_std.item()
         }
 
         return I_cfa, diagnostics
+
+
 
     def forward(self, x, stage: int = 2):
         # 1. 特征提取
@@ -280,7 +278,15 @@ class CausalMTLModel(nn.Module):
 
         # Global Vectors (for CKA)
         z_s = z_s_map.mean(dim=[2, 3])
-        z_p = z_p_map.mean(dim=[2, 3])
+        z_p_vec = F.adaptive_avg_pool2d(z_p_map, (1, 1)).flatten(1)
+        B, _, H, W = z_s_map.shape
+        # view 变回 [B, 64, 1, 1] -> expand 变成 [B, 64, H, W]
+        # -1 表示保持该维度不变（即通道数保持 64）
+        z_p_map = z_p_vec.view(B, -1, 1, 1).expand(B, -1, H, W)
+
+        # 注意：下面的代码中，z_p = z_p_vec (如果你之前写了 z_p = z_p_map.mean... 请确认 z_p 变量指向的是向量)
+        z_p = z_p_vec
+        #z_p = z_p_map.mean(dim=[2, 3])
 
         # 3. 准备任务输入 (Z_s based)
         f_proj = self.proj_f(combined_feat)
@@ -316,17 +322,26 @@ class CausalMTLModel(nn.Module):
             recon_geom_final, recon_geom_aux = self.decoder_geom(z_s_map)
 
         # 2. 图像重构 (Z_s + Z_p -> Image)
-        z_combined = torch.cat([z_s_map, z_p_map], dim=1)
-        if self.training and z_combined.requires_grad:
-            recon_app_final_logits, recon_app_aux_logits = checkpoint(self.decoder_app, z_combined, use_reentrant=False)
+        #z_combined = torch.cat([z_s_map, z_p_map], dim=1)
+        # if self.training and z_combined.requires_grad:
+        #     recon_app_final_logits, recon_app_aux_logits = checkpoint(self.decoder_app, z_combined, use_reentrant=False)
+        # else:
+        #     recon_app_final_logits, recon_app_aux_logits = self.decoder_app(z_combined)
+
+        if self.training and z_s_map.requires_grad:  # Checkpoint 需要特殊处理参数传递
+            # 注意：checkpoint 只能传 Tensor，需要把 z_p_vec 传进去
+            recon_app_final_logits, recon_app_aux_logits = checkpoint(
+                self.decoder_app, z_s_map, z_p_vec, use_reentrant=False
+            )
         else:
-            recon_app_final_logits, recon_app_aux_logits = self.decoder_app(z_combined)
+            recon_app_final_logits, recon_app_aux_logits = self.decoder_app(z_s_map, z_p_vec)
 
         recon_app_final = self.final_app_activation(recon_app_final_logits)
         recon_app_aux = self.final_app_activation(recon_app_aux_logits)
 
         # 3. 物理层分解
-        A = self.albedo_head(z_p_map)
+        #A = self.albedo_head(z_p_map)
+        A = self.albedo_head(z_p_vec)
         N = self.normal_head(z_s_map)
         L = self.light_head(h)
         S = shading_from_normals(N, L)

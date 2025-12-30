@@ -28,7 +28,7 @@ model:
 
 training:
   seed: 2024
-  epochs: 100          # Cityscapes 数据量较大且任务难，建议多跑一些 epoch
+  epochs: 100    # Cityscapes 数据量较大且任务难，建议多跑一些 epoch
   optimizer: "AdamW"
   learning_rate: 0.0002
   weight_decay: 0.0001

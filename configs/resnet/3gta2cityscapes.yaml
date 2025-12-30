@@ -5,12 +5,12 @@ data:
   # 目标域验证集 (Cityscapes Val) - 用于选最佳模型 (Oracle Selection)
   val_dataset_path: "/data/chengfengwu/alrl/mtl_dataset/cityscape_preprocess"
 
-  # 源域验证集 (GTA5 Val) - main.py 不会自动跑，需用 test_gta5.py 跑
+  # 源域验证集 (GTA5 Val)
   source_val_path: "/data/chengfengwu/alrl/mtl_dataset/gta5/val"
 
   batch_size: 32
   num_workers: 4
-  img_size: [128, 256] # 必须与 gta5_dataset.py 中的处理一致
+  img_size: [128, 256]
   pin_memory: True
 
 model:
@@ -18,7 +18,7 @@ model:
   encoder_name: "resnet50"
   pretrained: True
 
-  # 【关键】必须设为 7，因为 gta5_dataset.py 把标签映射到了 7 类
+  # 映射到 7 类
   num_seg_classes: 7
 
   latent_dim_s: 1024
@@ -35,53 +35,51 @@ model:
 
 training:
   seed: 2024
-  epochs: 200
+  epochs: 100
   optimizer: "AdamW"
-  learning_rate: 0.0002 # 迁移学习通常 LR 较小
+  learning_rate: 0.0002
   weight_decay: 0.0001
 
-  # 阶段控制
-  stage0_epochs: 20      # 预热分解
-  stage1_epochs: 5      # 预热任务头
-  ind_warmup_epochs: 50 # 10 epoch 后开启独立性约束
+  # === 阶段控制调整 ===
+  stage0_epochs: 10      # 预热分解
+  stage1_epochs: 5       # 预热任务头
+  ind_warmup_epochs: 20  # 【改动1】提早开启独立性约束 (原50 -> 20)
 
   lr_scheduler:
     type: "cosine"
     warmup_epochs: 10
     min_lr_factor: 0.01
 
-  # 【反事实增强】 Sim-to-Real 的核心，建议开启
+  # === 反事实增强调整 ===
   cfa:
     enabled: true
-    start_epoch: 100
+    start_epoch: 30
     prob: 0.5
-    lambda_cfa: 1.0
+    lambda_cfa: 0.5      # 【改动2】降低权重以减少震荡 (原1.0 -> 0.5)
     mix_strategy: "global"
 
 losses:
   # === 任务 Loss ===
   lambda_seg: 10.0
 
+  # 【改动3】大幅提升深度权重，强迫模型学习结构而非纹理 (原20.0 -> 50.0)
+  lambda_depth: 50.0
 
-  lambda_depth: 20.0
-
-  lambda_normal: 0.0 # 除非您有 GTA5 的法线真值，否则也设为 0
+  lambda_normal: 0.0
   lambda_edge_consistency: 0.0
 
   # === 独立性 Loss ===
-  lambda_independence: 0.1 # 稍微降低，因为跨域很难完全解耦
+  lambda_independence: 0.1
 
   # === 重构 Loss ===
-  # 即使没有深度监督，也可以尝试无监督的几何重构约束（如果有辅助Loss支持），
-  # 但稳妥起见，若无深度真值，建议降低或关闭几何重构权重
   alpha_recon_geom: 2.0
 
-  # 图像重构 (A*S = I) 是无监督分解的唯一动力
-  beta_recon_app: 5.0  # 加大权重，因为没有法线监督，重构是唯一的约束
+  # 【改动4】降低纹理重构权重，防止模型过度关注 GTA5 的虚假纹理 (原5.0 -> 2.0)
+  beta_recon_app: 2.0
   lambda_l1_recon: 2.0
 
-  # === 4. 物理先验 ===
-  lambda_img: 5.0      # 物理渲染重构权重
-  lambda_alb_tv: 0.1   # 纹理平滑
-  lambda_sh_gray: 0.1  # 光照约束
-  lambda_xcov: 0.5     # 去相关
+  # === 物理先验 ===
+  lambda_img: 5.0
+  lambda_alb_tv: 0.1
+  lambda_sh_gray: 0.1
+  lambda_xcov: 0.5

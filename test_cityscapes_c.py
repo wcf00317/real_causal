@@ -143,7 +143,7 @@ def main():
             # 运行评估
             # 这里的 evaluate 必须是你修改好(修复了score_fun)的版本
             metrics = evaluate(model, test_loader, criterion, device,
-                               stage=2, data_type="cityscapes_c", mask_zeros=True)
+                               stage=2, data_type="cityscapes_c")
 
             # 提取 4 个核心指标
             miou = metrics.get('seg_miou', 0.0)

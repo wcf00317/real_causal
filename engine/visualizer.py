@@ -121,11 +121,11 @@ def _visualize_mixer(model, batch_a, batch_b, device, save_path, scene_class_map
         Normal_A = model.normal_head(z_s_map_a)
 
         # 2. 风格源 (Style): 来自图片 B 的 Z_p
-        z_p_map_b = out_b['z_p_map']
+        z_p_vec_b = out_b['z_p']
 
         # [关键] 如果 Z_p 做了 Global Pooling (维度为 64 或 1x1)，需要 Albedo Head 支持或广播
         # 这里假设 albedo_head 能处理当前的 feature map (即使是 1x1 也能卷积)
-        Albedo_B = model.albedo_head(z_p_map_b)
+        Albedo_B = model.albedo_head(z_p_vec_b)
 
         # 3. 光照源: 来自图片 B 的全局特征 h
         _, h_b, _, _ = model.extract_features(rgb_b)
