@@ -3,8 +3,10 @@ data:
   dataset_path: "/data/chengfengwu/alrl/mtl_dataset/cityscape_preprocess"
   batch_size: 32
   num_workers: 4
-  img_size: [128, 256] # Cityscapes 也是 1:2 的比例，这个尺寸训练较快
+  img_size: [128, 256]
   pin_memory: true
+  # [注意] 请确保代码中的 transform 包含 ColorJitter, GaussianBlur 等强增强
+  # 仅靠 Config 里的 True 可能不够，要在 Dataset 代码里确认增强强度
 
 model:
   type: "causal"
@@ -13,52 +15,58 @@ model:
 
   # === 核心结构参数 ===
   num_seg_classes: 7
-  latent_dim_s: 1024   # 结构维度保持较高以保留细节
-  latent_dim_p: 64     # [修改] 降维至 64，强制构建信息瓶颈，防止 Style 泄漏
+  # [修改点 1] 结构瓶颈：1024太大了，足以记下“柏油路是灰色的”这种伪相关。
+  # 降到 512 甚至 256，逼迫 Zs 只能存形状，存不下纹理。
+  latent_dim_s: 512    # 原 1024 -> 512
+  # [修改点 2] 样式扩容：64太小，存不下“大雾”、“雪天”等复杂样式。
+  # 扩容后，Zp 才能真正把这些环境因素从 Zs 里剥离出来。
+  latent_dim_p: 256    # 原 64 -> 256
   z_s_bottleneck_noise: 0.1
 
-  # 物理分解头 (Cityscapes 无 GT 法线，此处作为无监督辅助任务)
+  # 物理分解头
   decomposition:
     enabled: true
     normal_head_hidden: 128
     albedo_head_hidden: 128
     light_head:
       sh_degree: 2
-      grayscale_prior: true # 户外光照通常比较自然，灰度先验有助于解耦
+      # [修改点 3] 解除灰度限制：户外光照(晚霞、蓝天)是有颜色的。
+      # 如果强制灰度，Zp 会被迫去学错误的颜色补偿，导致解耦失败。
+      grayscale_prior: false # 原 true -> false
 
 training:
   seed: 2024
-  epochs: 100    # Cityscapes 数据量较大且任务难，建议多跑一些 epoch
+  epochs: 100
   optimizer: "AdamW"
   learning_rate: 0.0002
   weight_decay: 0.0001
 
   # === 阶段控制 ===
-  stage0_epochs: 10     # 稍微延长预热，让无监督的分解先稳定下来
+  stage0_epochs: 10
   stage1_epochs: 5
-  ind_warmup_epochs: 20 # 晚一点引入 CKA，先让特征学会表达
+  ind_warmup_epochs: 20
 
   lr_scheduler:
     type: "cosine"
     warmup_epochs: 5
     min_lr_factor: 0.01
 
-  # === CFA 反事实增强配置 (如果你使用了新版 Trainer) ===
+  # === CFA 反事实增强配置 ===
+  # [修改点 4] 激活 CFA (关键!)：这就是让你从 Cityscapes -> Cityscapes-C 的核心。
+  # 它强制模型回答：“如果我把这辆车换上‘下雪’的纹理($Zp$)，它还是一辆车吗($Zs$)？”
   cfa:
-    enabled: false
-    start_epoch: 50
+    enabled: true      # 原 false -> true (必须打开！)
+    start_epoch: 20    # 原 50 -> 20 (越早介入，防止 Zs 形成纹理依赖)
     cka_threshold: 0.1
     prob: 0.5
-    lambda_cfa: 1.0
-    mix_strategy: "global" # 必须用 global，尤其是在户外场景，防止把天空贴到路面上
+    lambda_cfa: 1.0    # 强一致性约束
+    mix_strategy: "global"
 
 losses:
   # === 1. 下游任务 Loss ===
   lambda_seg: 10.0
   lambda_depth: 20.0
-
-  # [重要] Cityscapes 没有真实法线标签，权重必须设为 0
-  lambda_normal: 0.0
+  lambda_normal: 0.0   # Cityscapes 无 Normal GT，保持为 0
 
   lambda_edge_consistency: 0.1
 
@@ -66,15 +74,17 @@ losses:
   lambda_independence: 1.0
 
   # === 3. 重构 Loss ===
-  # 即使没有法线 GT，几何重构 (Zs -> Depth) 依然重要
   alpha_recon_geom: 2.0
 
-  # 图像重构 (A*S = I) 是无监督分解的唯一动力
-  beta_recon_app: 5.0  # 加大权重，因为没有法线监督，重构是唯一的约束
+  # [修改点 5] 重罚外观重构：
+  # 因为没有 Normal GT，光度一致性 (Photo-consistency) 是唯一的物理约束。
+  # 加大权重，迫使 Zp 必须学会解释图像中的所有颜色和光照，防止它们漏进 Zs。
+  beta_recon_app: 15.0  # 原 5.0 -> 15.0
   lambda_l1_recon: 2.0
 
   # === 4. 物理先验 ===
-  lambda_img: 5.0      # 物理渲染重构权重
-  lambda_alb_tv: 0.1   # 纹理平滑
-  lambda_sh_gray: 0.1  # 光照约束
-  lambda_xcov: 0.5     # 去相关
+  lambda_img: 5.0
+  lambda_alb_tv: 0.1
+  # [修改点 6] 配合 grayscale_prior: false 降低约束
+  lambda_sh_gray: 0.001 # 原 0.1 -> 0.001
+  lambda_xcov: 0.5

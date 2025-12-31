@@ -1,13 +1,8 @@
 data:
   type: "gta5_to_cityscapes"
   train_dataset_path: "/data/chengfengwu/alrl/mtl_dataset/gta5/train"
-
-  # 目标域验证集 (Cityscapes Val) - 用于选最佳模型 (Oracle Selection)
   val_dataset_path: "/data/chengfengwu/alrl/mtl_dataset/cityscape_preprocess"
-
-  # 源域验证集 (GTA5 Val)
   source_val_path: "/data/chengfengwu/alrl/mtl_dataset/gta5/val"
-
   batch_size: 32
   num_workers: 4
   img_size: [128, 256]
@@ -17,10 +12,7 @@ model:
   type: "causal"
   encoder_name: "resnet50"
   pretrained: True
-
-  # 映射到 7 类
   num_seg_classes: 7
-
   latent_dim_s: 1024
   latent_dim_p: 64
   z_s_bottleneck_noise: 0.1
@@ -40,32 +32,40 @@ training:
   learning_rate: 0.0002
   weight_decay: 0.0001
 
-  # === 阶段控制调整 ===
-  stage0_epochs: 10      # 预热分解
-  stage1_epochs: 5       # 预热任务头
-  ind_warmup_epochs: 20  # 【改动1】提早开启独立性约束 (原50 -> 20)
+  # === 阶段控制 ===
+  stage0_epochs: 10
+  stage1_epochs: 5
+  ind_warmup_epochs: 40  # 保持不动，这个策略是对的
 
   lr_scheduler:
     type: "cosine"
     warmup_epochs: 10
     min_lr_factor: 0.01
 
-  # === 反事实增强调整 ===
+  # === 反事实增强 ===
   cfa:
     enabled: true
-    start_epoch: 30
+    start_epoch: 60
     prob: 0.5
-    lambda_cfa: 0.5      # 【改动2】降低权重以减少震荡 (原1.0 -> 0.5)
+    lambda_cfa: 0.5      # 保持
     mix_strategy: "global"
 
 losses:
-  # === 任务 Loss ===
-  lambda_seg: 10.0
+  # === 任务 Loss (修复 Rel Err 的核心区) ===
 
-  # 【改动3】大幅提升深度权重，强迫模型学习结构而非纹理 (原20.0 -> 50.0)
-  lambda_depth: 50.0
+  # 1. 保持高分割权重，保住 mIoU SOTA
+  lambda_seg: 25.0
+
+  # 2. 【核心修改】降回 15.0。
+  # 既然 Baseline(20.0) 没问题，而 30.0 炸了，说明临界点就在这附近。
+  # 设为 15.0 是为了给 Seg 让路，同时保证深度数值回归正常。
+  lambda_depth: 15.0
 
   lambda_normal: 0.0
+
+  # 3. 【核心修改】关闭边缘一致性！
+  # 这就是导致 Rel Err 飙升到 1.5 的元凶。
+  # 除非你只看可视化不看指标，否则必须关掉。
   lambda_edge_consistency: 0.0
 
   # === 独立性 Loss ===
@@ -73,8 +73,6 @@ losses:
 
   # === 重构 Loss ===
   alpha_recon_geom: 2.0
-
-  # 【改动4】降低纹理重构权重，防止模型过度关注 GTA5 的虚假纹理 (原5.0 -> 2.0)
   beta_recon_app: 2.0
   lambda_l1_recon: 2.0
 

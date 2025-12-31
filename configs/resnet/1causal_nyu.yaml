@@ -1,7 +1,7 @@
 data:
   type: "nyuv2"
   dataset_path: "../mtl_dataset/nyuv2"
-  batch_size: 16   # 如果显存允许，尽量开大
+  batch_size: 16
   num_workers: 4
   img_size: [288, 384]
   augmentation: True
@@ -10,18 +10,20 @@ model:
   type: "causal"
   encoder_name: "resnet50"
   pretrained: True
-  latent_dim_s: 1024
-  latent_dim_p: 64
-  z_s_bottleneck_noise: 0.1 # 稍微加点噪声防止过拟合
+  # [修改点 1] 维度平衡：削减 Zs 防止其“偷懒”，扩大 Zp 给纹理留足空间
+  latent_dim_s: 512    # 原 1024 -> 降为 512
+  latent_dim_p: 256    # 原 64 -> 增为 256 (关键！)
+  z_s_bottleneck_noise: 0.1
 
-  # 物理分解头配置 (对应 models/causal_model.py 中的 decomposition parts)
+  # 物理分解头配置
   decomposition:
     enabled: true
     normal_head_hidden: 128
     albedo_head_hidden: 128
     light_head:
       sh_degree: 2
-      grayscale_prior: true
+      # [修改点 2] 解除灰度封印：室内光照(NYUv2)通常是暖色，强制灰度会导致 Zp 颜色坍塌
+      grayscale_prior: false  # 原 true -> 改为 false
 
 training:
   seed: 2024
@@ -29,12 +31,11 @@ training:
   optimizer: "AdamW"
   learning_rate: 0.0002
   weight_decay: 0.0001
-  # [已删除] gate_lr: 0.02 (因为融合门控模块已彻底移除)
 
   # === 时间表控制 ===
-  stage0_epochs: 5     # 阶段0: 仅训练分解重构 (A*S=I)，不更新任务头
-  stage1_epochs: 0     # 阶段1: 强力预热 (可视情况设为 0-5)
-  ind_warmup_epochs: 10 # CKA 损失从第 10 epoch 开始介入
+  stage0_epochs: 5
+  stage1_epochs: 0
+  ind_warmup_epochs: 10
 
   lr_scheduler:
     type: "cosine"
@@ -43,44 +44,34 @@ training:
 
   cfa:
     enabled: true
-    start_epoch: 500
+    # [修改点 3] 激活 CFA：原 500 导致永远不运行，改为 20 让其尽早介入强迫解耦
+    start_epoch: 20    # 原 500 -> 改为 20 (Stage 0 预热后尽快开启)
     cka_threshold: 0.1
     prob: 0.5
     lambda_cfa: 1.0
     mix_strategy: "global"
 
 losses:
-  # === 1. 核心任务 Loss (Zs -> Tasks) ===
-  # 建议权重稍微加大，保证 Zs 包含足够的语义结构信息
+  # === 1. 核心任务 Loss ===
   lambda_seg: 20.0
   lambda_depth: 10.0
   lambda_normal: 10.0
-  # lambda_scene: 0.0 (代码中未涉及 Scene Head，设为0或删除)
   lambda_edge_consistency: 0.1
 
-  # [已删除] lambda_depth_zp: 1.0
-  # 原因：因果解耦要求 Zp 不能包含几何信息，因此我们删除了 Zp->Depth 的预测路径
-
-  # === 2. 独立性约束 (CKA Loss) ===
-  # 强制 Zs 和 Zp 统计独立
+  # === 2. 独立性约束 ===
   lambda_independence: 1.0
 
   # === 3. 重构 Loss (Reconstruction) ===
-  # 几何重构 (Zs -> Depth)
+  # 几何重构
   alpha_recon_geom: 2.0
 
-  # 外观重构 (Zs + Zp -> Image)
-  beta_recon_app: 2.0
-  lambda_l1_recon: 1.0
+  # [修改点 4] 重罚样式错误：原 2.0 太低，导致模型“躺平”。加倍惩罚迫使 Zp 学习纹理
+  beta_recon_app: 15.0   # 原 2.0 -> 暴增为 15.0 (与 Seg Loss 量级抗衡)
+  lambda_l1_recon: 2.0   # 原 1.0 -> 增为 2.0 (辅助提升像素级还原)
 
-  # (注：Auxiliary loss 的权重在代码中固定为 0.5，此处无需配置)
-
-  # === 4. 物理分解与先验 (Decomposition Priors) ===
-  # 确保 Zp 学习到的是 Albedo 纹理，而不是随便什么高频信息
-  lambda_img: 2.0        # A*S 与原图的 L1 Loss
-  lambda_alb_tv: 0.1     # Albedo 平滑性 (Total Variation)
-  lambda_sh_gray: 0.1    # Shading 灰度偏好
-  lambda_xcov: 0.5       # Albedo 和 Normal 的去相关 (Cross Covariance)
-
-  # [已删除] 复杂的边缘一致性 Loss (seg_edge_from_geom 等)
-  # 原因：已在代码瘦身过程中移除，以保证 Pipeline 的纯粹性
+  # === 4. 物理分解与先验 ===
+  lambda_img: 2.0
+  lambda_alb_tv: 0.1
+  # [修改点 5] 降低灰度惩罚：配合 grayscale_prior: false
+  lambda_sh_gray: 0.001  # 原 0.1 -> 降为 0.001 (只保留极微弱的约束)
+  lambda_xcov: 0.5
