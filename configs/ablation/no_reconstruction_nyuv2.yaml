@@ -1,0 +1,77 @@
+data:
+  type: "nyuv2"
+  dataset_path: "../mtl_dataset/nyuv2"
+  batch_size: 16
+  num_workers: 4
+  img_size: [288, 384]
+  augmentation: True
+
+model:
+  type: "causal"
+  encoder_name: "resnet50"
+  pretrained: True
+  # === 保持原配置的结构设计 ===
+  latent_dim_s: 512
+  latent_dim_p: 256
+  z_s_bottleneck_noise: 0.1
+
+  # 物理分解头配置 (虽然这里 enabled=true，但因为 loss 全为 0，实际上不会产生梯度更新)
+  decomposition:
+    enabled: true
+    normal_head_hidden: 128
+    albedo_head_hidden: 128
+    light_head:
+      sh_degree: 2
+      grayscale_prior: false
+
+training:
+  seed: 2024
+  epochs: 100
+  optimizer: "AdamW"
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+
+  # === 时间表控制 ===
+  stage0_epochs: 5
+  stage1_epochs: 0
+  ind_warmup_epochs: 10
+
+  lr_scheduler:
+    type: "cosine"
+    warmup_epochs: 5
+    min_lr_factor: 0.01
+
+  cfa:
+    enabled: true
+    start_epoch: 20
+    cka_threshold: 0.1
+    prob: 0.5
+    lambda_cfa: 1.0
+    mix_strategy: "global"
+
+losses:
+  # === 1. 核心任务 Loss (保持不变) ===
+  lambda_seg: 20.0
+  lambda_depth: 10.0
+  lambda_normal: 10.0
+  lambda_edge_consistency: 0.1
+
+  # === 2. 独立性约束 (保持不变，看看没有重构时 CKA 会发生什么) ===
+  lambda_independence: 1.0
+
+  # === [关键修改] 3. 重构 Loss (全部设为 0.0) ===
+  # 实验目的：移除 Decoder 的监督信号，验证其对 Zp 吸收纹理的必要性
+
+  # 几何重构 (Zs -> Depth/Normal)
+  alpha_recon_geom: 0.0   # 原 2.0 -> 改为 0.0
+
+  # 外观重构 (Zs + Zp -> Image)
+  beta_recon_app: 0.0     # 原 15.0 -> 改为 0.0
+  lambda_l1_recon: 0.0    # 原 2.0 -> 改为 0.0
+
+  # === 4. 物理分解与先验 (全部设为 0.0) ===
+  # 因为不再重构图像，这些物理约束也应一并移除
+  lambda_img: 0.0         # 原 2.0 -> 改为 0.0
+  lambda_alb_tv: 0.0      # 原 0.1 -> 改为 0.0
+  lambda_sh_gray: 0.0     # 原 0.001 -> 改为 0.0 
+  lambda_xcov: 0.0        # 原 0.5 -> 改为 0.0

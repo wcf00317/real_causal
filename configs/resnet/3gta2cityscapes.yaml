@@ -32,12 +32,10 @@ training:
   learning_rate: 0.0002
   weight_decay: 0.0001
 
-  # === 阶段控制 ===
+  # === 阶段控制 (SOTA 策略) ===
   stage0_epochs: 10
   stage1_epochs: 5
-  # [平衡策略 1] 独立性预热取中间值 (30)
-  # 让 Zs/Zp 在 Epoch 30 开始分离，比20稳，比40快，给 Seg 留出更多优化时间
-  ind_warmup_epochs: 30
+  ind_warmup_epochs: 30  # 锁定30，黄金平衡点
 
   lr_scheduler:
     type: "cosine"
@@ -47,42 +45,33 @@ training:
   # === 反事实增强 (CFA) ===
   cfa:
     enabled: true
-    # [平衡策略 2] CFA 启动时机取中间值 (45)
-    # 确保 Feature 已经比较成熟后再引入扰动，防止 Depth 崩塌
-    start_epoch: 45
-    # [平衡策略 3] 稍微降低概率 (0.5 -> 0.4)
-    # 减少风格扰动的频率，保护对噪声敏感的 Depth 任务
-    prob: 0.4
+    start_epoch: 35      # 提前到35，抢占泛化窗口期
+    prob: 0.5            # 保持强度
     lambda_cfa: 0.5
     mix_strategy: "global"
 
 losses:
-  # === 任务 Loss ===
+  # === 任务 Loss (高能双驱) ===
+  lambda_seg: 30.0    # 暴力提权，冲击 mIoU > 0.58
+  lambda_depth: 25.0  # 同步跟进，稳住 Abs Err < 0.10
 
-  # 1. Seg 保持高位，保住 mIoU SOTA
-  lambda_seg: 25.0
-
-  # 2. [平衡策略 4] 提升 Depth 权重 (15.0 -> 20.0)
-  # 为了抵抗 CFA 在中期带来的分布冲击，必须给 Depth 更多的话语权
-  lambda_depth: 20.0
-
+  # 【防报错补全】显式设为 0.0
   lambda_normal: 0.0
-
-  # 3. 必须保持关闭！边缘一致性是导致 Rel Err 飙升的元凶
-  lambda_edge_consistency: 0.0
+  lambda_edge_consistency: 0.0  # 必须是 0！防 Rel Err 爆炸
 
   # === 独立性 Loss ===
-  lambda_independence: 0.1
+  lambda_independence: 0.1 #
 
-  # === 重构 Loss ===
-  # [平衡策略 5] 增强几何重构 (2.0 -> 3.0)
-  # 利用 Zs 的纯净性来辅助 Depth 回归
-  alpha_recon_geom: 3.0
+  # === 重构 Loss (SOTA 策略) ===
+  # 【关键】就是这个键漏了导致的报错，现在补上了！
+  # 设为 5.0，既让物理约束生效，又不引入太多噪声
+  alpha_recon_geom: 5.0
+
   beta_recon_app: 2.0
   lambda_l1_recon: 2.0
 
-  # === 物理先验 ===
-  lambda_img: 5.0
-  lambda_alb_tv: 0.1
-  lambda_sh_gray: 0.1
-  lambda_xcov: 0.5
+  # === 物理先验 (全部补齐) ===
+  lambda_img: 5.0      # 物理渲染重构权重
+  lambda_alb_tv: 0.1   # 纹理平滑
+  lambda_sh_gray: 0.1  # 光照约束
+  lambda_xcov: 0.5     # 去相关

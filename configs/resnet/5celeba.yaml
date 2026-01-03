@@ -9,7 +9,7 @@ data:
   num_workers: 8       # 数据读取线程数
   img_size: [128, 128] # CelebA 标准尺寸，也适合 ResNet18
   pin_memory: true
-  num_attributes: 40
+  num_attributes: 10
 
 model:
   type: "causal_celeba"
@@ -20,7 +20,7 @@ model:
   latent_dim_p: 64    # 风格/背景特征 (Z_p)
 
   # 任务定义
-  num_attributes: 40   # CelebA 默认属性数
+  num_attributes: 10   # CelebA 默认属性数
 
 training:
   seed: 2024

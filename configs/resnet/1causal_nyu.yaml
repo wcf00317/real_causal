@@ -11,8 +11,8 @@ model:
   encoder_name: "resnet50"
   pretrained: True
   # [修改点 1] 维度平衡：削减 Zs 防止其“偷懒”，扩大 Zp 给纹理留足空间
-  latent_dim_s: 512    # 原 1024 -> 降为 512
-  latent_dim_p: 256    # 原 64 -> 增为 256 (关键！)
+  latent_dim_s: 512 #1024 #512    # 原 1024 -> 降为 512
+  latent_dim_p: 256 #64 #256    # 原 64 -> 增为 256 (关键！)
   z_s_bottleneck_noise: 0.1
 
   # 物理分解头配置
