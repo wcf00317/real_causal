@@ -166,10 +166,23 @@ class CausalMTLModel(nn.Module):
         self.proj_z_s = nn.Conv2d(self.latent_dim_s, PROJ_CHANNELS, kernel_size=1)
         # 移除了 self.proj_z_p，因为任务头不再需要它
 
+        # [修改] 读取 Leakage 开关
+        self.ablation_leak_zp = model_config.get('ablation_leak_zp', False)
+
+        if self.ablation_leak_zp:
+            # 如果开启泄露，我们需要一个 Projector 把 Z_p 映射到相同维度以便拼接
+            self.proj_z_p = nn.Conv2d(self.latent_dim_p, PROJ_CHANNELS, kernel_size=1)
+            # 输入 = Backbone特征 + Z_s特征 + Z_p特征
+            task_in_dim = PROJ_CHANNELS * 3
+            print(f"⚠️ [ABLATION] Leakage Mode ON: Task heads input dim set to {task_in_dim} (including Z_p)")
+        else:
+            self.proj_z_p = None
+            # 输入 = Backbone特征 + Z_s特征
+            task_in_dim = PROJ_CHANNELS * 2
+
         # --- Task Heads (Inputs: Z_s Only) ---
         num_seg_classes = model_config.get('num_seg_classes', 40)
         # 输入 = Backbone特征 + Z_s特征
-        task_in_dim = PROJ_CHANNELS * 2
 
         self.head_seg = TaskHead(task_in_dim, num_seg_classes)
         self.head_depth = TaskHead(task_in_dim, 1, use_sigmoid=False)
@@ -291,7 +304,15 @@ class CausalMTLModel(nn.Module):
         # 3. 准备任务输入 (Z_s based)
         f_proj = self.proj_f(combined_feat)
         zs_proj = self.proj_z_s(z_s_map)
-        task_input = torch.cat([f_proj, zs_proj], dim=1)
+
+        if self.ablation_leak_zp:
+            # [修改] 这里的 z_p_map 已经是被 expand 过的 [B, C, H, W]
+            # 我们将其投影并拼接到输入中
+            zp_proj = self.proj_z_p(z_p_map)
+            task_input = torch.cat([f_proj, zs_proj, zp_proj], dim=1)
+        else:
+            # 正常模式：只用 Z_s
+            task_input = torch.cat([f_proj, zs_proj], dim=1)
 
         # ======================================================================
         # [下游任务预测]

@@ -1,18 +1,44 @@
 import torch
 import torch.nn as nn
-from .building_blocks import ViTEncoder, MLP
-# 复用你在 causal_model.py 中定义的普通解码器
-from .causal_model import SegDepthDecoder
 import torch.nn.functional as F
+from .building_blocks import ViTEncoder, MLP, ResNetEncoder
 
+
+# ==============================================================================
+# Helper Classes (内置实现通用解码头，解决 Import Error)
+# ==============================================================================
+
+class SegDepthDecoder(nn.Module):
+    """
+    通用分割/深度/法线预测头
+    结构: Conv-BN-ReLU -> Conv -> Upsample
+    """
+
+    def __init__(self, input_channels, output_channels, scale_factor=8):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(input_channels, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, output_channels, kernel_size=1)
+        )
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        out = self.head(x)
+        if self.scale_factor > 1:
+            out = F.interpolate(out, scale_factor=self.scale_factor, mode='bilinear', align_corners=True)
+        return out
+
+
+# ==============================================================================
+# Models
+# ==============================================================================
 
 class SingleTaskModel(nn.Module):
     """
     Single-Task Learning (STL) Baseline.
-
-    【修正版】
-    增加了 Dummy Predictors，以兼容 evaluator.py 的属性读取需求。
-    无论当前激活哪个任务，都会提供 num_seg_classes 和 num_scene_classes 信息。
+    【已适配 ResNet & ViT，且补全 Normal 任务】
     """
 
     def __init__(self, model_config, data_config):
@@ -23,13 +49,23 @@ class SingleTaskModel(nn.Module):
 
         print(f"🔒 Initializing Single-Task Model for: [{self.active_task.upper()}]")
 
-        # 1. Backbone
-        self.encoder = ViTEncoder(
-            name=model_config['encoder_name'],
-            pretrained=model_config['pretrained'],
-            img_size=self.img_size[0]
-        )
-        encoder_feature_dim = self.encoder.feature_dim
+        # 1. Backbone (ResNet or ViT)
+        encoder_name = model_config['encoder_name']
+        if 'resnet' in encoder_name:
+            self.encoder = ResNetEncoder(name=encoder_name, pretrained=model_config['pretrained'], dilated=True)
+            target_dim = 1024
+            self.resnet_adapters = nn.ModuleList([
+                nn.Conv2d(in_c, target_dim, kernel_size=1) for in_c in self.encoder.feature_dims
+            ])
+            encoder_feature_dim = target_dim
+        else:
+            self.encoder = ViTEncoder(
+                name=encoder_name,
+                pretrained=model_config['pretrained'],
+                img_size=self.img_size[0]
+            )
+            encoder_feature_dim = self.encoder.feature_dim
+            self.resnet_adapters = None
 
         # 2. Projection
         combined_feature_dim = encoder_feature_dim * 4
@@ -37,31 +73,39 @@ class SingleTaskModel(nn.Module):
         self.shared_proj = nn.Conv2d(combined_feature_dim, self.shared_dim, kernel_size=1)
 
         # 3. Task Configs
-        self.num_seg_classes = 40
+        self.num_seg_classes = model_config.get('num_seg_classes', 40)
         self.num_scene_classes = model_config.get('num_scene_classes', 27)
 
         # 4. Initialize Heads & Dummy Attributes
-        # -------------------------------------------------------------------------
-        # 关键修改：无论激活哪个任务，都确保 self.predictor_xxx 存在，且有必要的属性
-        # -------------------------------------------------------------------------
+
+        # 统一缩放因子
+        scale = 8 if 'resnet' in encoder_name else 16
 
         # --- Segmentation ---
         if self.active_task == 'seg':
-            self.seg_head = SegDepthDecoder(input_channels=self.shared_dim, output_channels=self.num_seg_classes)
+            self.seg_head = SegDepthDecoder(input_channels=self.shared_dim, output_channels=self.num_seg_classes,
+                                            scale_factor=scale)
             self.predictor_seg = self.seg_head
         else:
             self.seg_head = None
-            # Dummy Object with .output_channels
             self.predictor_seg = nn.Module()
             self.predictor_seg.output_channels = self.num_seg_classes
 
         # --- Depth ---
         if self.active_task == 'depth':
-            self.depth_head = SegDepthDecoder(input_channels=self.shared_dim, output_channels=1)
+            self.depth_head = SegDepthDecoder(input_channels=self.shared_dim, output_channels=1, scale_factor=scale)
             self.predictor_depth = self.depth_head
         else:
             self.depth_head = None
-            self.predictor_depth = nn.Module()  # depth head usually has no specific attr accessed by evaluator
+            self.predictor_depth = nn.Module()
+
+        # --- Normal (🔥 补全) ---
+        if self.active_task == 'normal':
+            self.normal_head = SegDepthDecoder(input_channels=self.shared_dim, output_channels=3, scale_factor=scale)
+            self.predictor_normal = self.normal_head
+        else:
+            self.normal_head = None
+            self.predictor_normal = nn.Module()
 
         # --- Scene ---
         if self.active_task == 'scene':
@@ -69,7 +113,6 @@ class SingleTaskModel(nn.Module):
             self.predictor_scene = self.scene_mlp
         else:
             self.scene_mlp = None
-            # Dummy Object with .out_features
             self.predictor_scene = nn.Module()
             self.predictor_scene.out_features = self.num_scene_classes
 
@@ -86,7 +129,18 @@ class SingleTaskModel(nn.Module):
         B, _, H, W = x.shape
 
         # 1. Encoder
-        features = self.encoder(x)
+        raw_features = self.encoder(x)
+
+        if self.resnet_adapters is not None:
+            features = []
+            target_h, target_w = raw_features[2].shape[-2:]
+            for i, feat in enumerate(raw_features):
+                feat = self.resnet_adapters[i](feat)
+                if feat.shape[-2:] != (target_h, target_w):
+                    feat = F.interpolate(feat, size=(target_h, target_w), mode='bilinear', align_corners=False)
+                features.append(feat)
+        else:
+            features = raw_features
 
         # 2. Aggregation
         combined_feat = torch.cat(features, dim=1)
@@ -94,50 +148,74 @@ class SingleTaskModel(nn.Module):
 
         outputs = {}
 
-        # 3. Active Task Forward (others return Zeros)
-        # 注意：evaluator 会把这些全零的输出和真实标签做计算，得到很差的分数（这是符合预期的）
+        # 3. Active Task Forward
 
         # Seg
         if self.active_task == 'seg':
             outputs['pred_seg'] = self.seg_head(shared_feat)
+            if outputs['pred_seg'].shape[-2:] != (H, W):
+                outputs['pred_seg'] = F.interpolate(outputs['pred_seg'], size=(H, W), mode='bilinear',
+                                                    align_corners=False)
         else:
             outputs['pred_seg'] = torch.zeros(B, self.num_seg_classes, H, W, device=x.device)
 
         # Depth
         if self.active_task == 'depth':
             outputs['pred_depth'] = self.depth_head(shared_feat)
+            if outputs['pred_depth'].shape[-2:] != (H, W):
+                outputs['pred_depth'] = F.interpolate(outputs['pred_depth'], size=(H, W), mode='bilinear',
+                                                      align_corners=False)
         else:
             outputs['pred_depth'] = torch.zeros(B, 1, H, W, device=x.device)
 
+        # Normal (🔥 补全)
+        if self.active_task == 'normal':
+            pred_normal = self.normal_head(shared_feat)
+            if pred_normal.shape[-2:] != (H, W):
+                pred_normal = F.interpolate(pred_normal, size=(H, W), mode='bilinear', align_corners=False)
+            outputs['pred_normal'] = F.normalize(pred_normal, p=2, dim=1)
+        else:
+            outputs['pred_normal'] = torch.zeros(B, 3, H, W, device=x.device)
+
         # Scene
         if self.active_task == 'scene':
-            h = torch.nn.functional.adaptive_avg_pool2d(shared_feat, (1, 1)).flatten(1)
+            h = F.adaptive_avg_pool2d(shared_feat, (1, 1)).flatten(1)
             outputs['pred_scene'] = self.scene_mlp(h)
         else:
             outputs['pred_scene'] = torch.zeros(B, self.num_scene_classes, device=x.device)
 
         return outputs
 
+
 class RawMTLModel(nn.Module):
     """
     Standard Hard Parameter Sharing Multi-Task Learning (Raw MTL).
-
-    【工程适配版】
-    包含特定的属性别名和占位符，以兼容 Causal MTL 项目现有的 trainer.py 和 evaluator.py，
-    无需修改公共训练代码。
+    【已适配 ResNet & ViT，且补全 Normal 任务】
     """
 
     def __init__(self, model_config, data_config):
         super().__init__()
         self.config = model_config
 
-        # 1. Shared Backbone (Same as Ours)
-        self.encoder = ViTEncoder(
-            name=model_config['encoder_name'],
-            pretrained=model_config['pretrained'],
-            img_size=data_config['img_size'][0]
-        )
-        encoder_feature_dim = self.encoder.feature_dim
+        # 1. Shared Backbone
+        encoder_name = model_config['encoder_name']
+        if 'resnet' in encoder_name:
+            self.encoder = ResNetEncoder(name=encoder_name, pretrained=model_config['pretrained'], dilated=True)
+            target_dim = 1024
+            self.resnet_adapters = nn.ModuleList([
+                nn.Conv2d(in_c, target_dim, kernel_size=1) for in_c in self.encoder.feature_dims
+            ])
+            encoder_feature_dim = target_dim
+            self.is_resnet = True
+        else:
+            self.encoder = ViTEncoder(
+                name=encoder_name,
+                pretrained=model_config['pretrained'],
+                img_size=data_config['img_size'][0]
+            )
+            encoder_feature_dim = self.encoder.feature_dim
+            self.resnet_adapters = None
+            self.is_resnet = False
 
         # 2. Shared Projection (Bottleneck)
         combined_feature_dim = encoder_feature_dim * 4
@@ -145,31 +223,34 @@ class RawMTLModel(nn.Module):
         self.shared_proj = nn.Conv2d(combined_feature_dim, self.shared_dim, kernel_size=1)
 
         # 3. Task Heads
+        scale = 8 if self.is_resnet else 16
 
         # --- Scene Head ---
-        self.num_scene_classes = model_config['num_scene_classes']
-        # 注意：为了兼容 evaluator 读取 .out_features，我们把 MLP 独立出来
+        self.num_scene_classes = model_config.get('num_scene_classes', 27)
         self.scene_mlp = MLP(self.shared_dim, self.num_scene_classes, hidden_dim=256)
 
         # --- Seg Head ---
-        #self.num_seg_classes = 40
         self.num_seg_classes = model_config.get('num_seg_classes', 40)
-        self.seg_head = SegDepthDecoder(input_channels=self.shared_dim, output_channels=self.num_seg_classes)
+        self.seg_head = SegDepthDecoder(input_channels=self.shared_dim, output_channels=self.num_seg_classes,
+                                        scale_factor=scale)
 
         # --- Depth Head ---
-        self.depth_head = SegDepthDecoder(input_channels=self.shared_dim, output_channels=1)
+        self.depth_head = SegDepthDecoder(input_channels=self.shared_dim, output_channels=1, scale_factor=scale)
+
+        # --- Normal Head (🔥 补全) ---
+        self.normal_head = SegDepthDecoder(input_channels=self.shared_dim, output_channels=3, scale_factor=scale)
 
         # =========================================================
-        #   兼容性适配层 (Compatibility Layer) - 关键修改
+        #   兼容性适配层 (Compatibility Layer)
         # =========================================================
 
-        # 1. [For Evaluator] 提供别名，因为 evaluator.py 访问的是 predictor_xxx
+        # 1. [For Evaluator] 提供别名
         self.predictor_seg = self.seg_head
         self.predictor_depth = self.depth_head
-        self.predictor_scene = self.scene_mlp  # evaluator 读取 .out_features
+        self.predictor_normal = self.normal_head  # 补全
+        self.predictor_scene = self.scene_mlp
 
-        # 2. [For Trainer] 提供占位符，欺骗 _switch_stage_freeze
-        # trainer.py 会尝试访问这些属性并设置梯度。设为 None 可安全跳过。
+        # 2. [For Trainer] 占位符
         self.projector_p_seg = None
         self.projector_p_depth = None
         self.proj_z_p_seg = None
@@ -178,14 +259,23 @@ class RawMTLModel(nn.Module):
         self.zp_depth_refiner = None
         self.decoder_zp_depth = None
 
-        # 3. [For GradNorm] 预留共享层接口
+        # 3. [For GradNorm]
         self.layer_to_norm = self.shared_proj
 
     def forward(self, x, stage=None):
-        # stage 参数被保留以兼容 trainer 接口调用，但此处忽略
-
         # 1. Encoder
-        features = self.encoder(x)
+        raw_features = self.encoder(x)
+
+        if self.resnet_adapters is not None:
+            features = []
+            target_h, target_w = raw_features[2].shape[-2:]
+            for i, feat in enumerate(raw_features):
+                feat = self.resnet_adapters[i](feat)
+                if feat.shape[-2:] != (target_h, target_w):
+                    feat = F.interpolate(feat, size=(target_h, target_w), mode='bilinear', align_corners=False)
+                features.append(feat)
+        else:
+            features = raw_features
 
         # 2. Aggregation
         combined_feat = torch.cat(features, dim=1)
@@ -194,16 +284,29 @@ class RawMTLModel(nn.Module):
         # 3. Task Predictions
         pred_seg = self.seg_head(shared_feat)
         pred_depth = self.depth_head(shared_feat)
+        pred_normal = self.normal_head(shared_feat)  # 补全
 
-        # Scene: Pool -> Flatten -> MLP
+        # 确保尺寸一致
+        img_h, img_w = x.shape[-2:]
+        if pred_seg.shape[-2:] != (img_h, img_w):
+            pred_seg = F.interpolate(pred_seg, size=(img_h, img_w), mode='bilinear', align_corners=False)
+        if pred_depth.shape[-2:] != (img_h, img_w):
+            pred_depth = F.interpolate(pred_depth, size=(img_h, img_w), mode='bilinear', align_corners=False)
+        if pred_normal.shape[-2:] != (img_h, img_w):
+            pred_normal = F.interpolate(pred_normal, size=(img_h, img_w), mode='bilinear', align_corners=False)
+
+        # Normal 归一化
+        pred_normal = F.normalize(pred_normal, p=2, dim=1)
+
+        # Scene
         h = F.adaptive_avg_pool2d(shared_feat, (1, 1)).flatten(1)
         pred_scene = self.scene_mlp(h)
 
         return {
             'pred_seg': pred_seg,
             'pred_depth': pred_depth,
+            'pred_normal': pred_normal,  # 补全 key
             'pred_scene': pred_scene,
-            # 'z_s', 'z_p' 等不需要返回，因为使用的是 MTLLoss 而非 CompositeLoss
         }
 
     def get_last_shared_layer(self):

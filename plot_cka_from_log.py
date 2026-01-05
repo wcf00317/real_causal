@@ -4,13 +4,8 @@
 从多个训练日志中抽取 Validation Indep(CKA) 并画在同一张图上。
 
 用法：
-    python plot_cka_from_log.py \
-        --logs runs/2026-01-03_11-48/run.log \
-               runs/2026-01-03_11-49/run.log \
-               runs/2026-01-03_11-51/run.log \
-               runs/2026-01-03_14-/run.log
-               runs/2026-01-03_11-52/run.log \
-        --lambdas 0 0.1 1.0 10.0 100.0
+    python plot_cka_from_log.py --logs runs/2026-01-03_11-48/run.log runs/2026-01-03_11-49/run.log runs/2026-01-03_11-51/run.log runs/2026-01-03_14-02/run.log runs/2026-01-03_11-52/run.log --lambdas 0 0.1 1.0 10.0 100.0
+
 """
 
 import re
@@ -35,7 +30,7 @@ def extract_val_cka_from_log(log_path: str) -> Tuple[List[int], List[float]]:
 
     with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
-            # 匹配 epoch 行：----- Epoch 6/100 (Stage 2) | lr=...
+            # ----- Epoch 6/100 (Stage 2) | lr=...
             m_epoch = re.search(r"-----\s*Epoch\s+(\d+)\s*/\s*\d+", line)
             if m_epoch:
                 cur_epoch = int(m_epoch.group(1))
@@ -64,18 +59,12 @@ def plot_multi_cka(
 ):
     """
     从多个 log 中抽取 Validation CKA 并画图。
-
-    参数:
-        log_paths: 多个 run.log 路径
-        lambdas  : 与 log_paths 对应的 lambda 值（字符串），用于图例。
-                   如果为 None，则使用文件名作为图例。
-        out_name : 输出文件名（保存到当前工作目录）
     """
     if lambdas is not None and len(lambdas) != len(log_paths):
         raise ValueError("len(lambdas) 必须等于 len(log_paths)。")
 
-    # 论文友好的全局样式
-    plt.style.use("ggplot")
+    # 使用默认白色背景样式
+    plt.style.use("default")
     plt.rcParams.update({
         "figure.figsize": (8, 5),
         "axes.labelsize": 14,
@@ -85,10 +74,22 @@ def plot_multi_cka(
     })
 
     fig, ax = plt.subplots()
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
 
-    # 不同曲线用不同线型/marker，方便区分
-    linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
-    markers = ["o", "s", "^", "D", "v"]
+    # 不同曲线用不同 marker，线型统一为实线
+    markers = ["o", "s", "^", "D", "v", "P", "X"]
+
+    # λ -> 颜色 显式映射
+    lambda_color_map = {
+        0.0: "black",        # λ=0
+        0.1: "tab:blue",     # λ=0.1
+        1.0: "tab:red",      # λ=1
+        10.0: "tab:green",   # λ=10
+        100.0: "tab:orange", # λ=100
+    }
+    # 其他未在 map 中的 λ，用一小组备用颜色（不含棕色、灰色）
+    fallback_colors = ["tab:purple", "tab:cyan", "tab:pink", "tab:olive"]
 
     y_all = []
 
@@ -100,21 +101,38 @@ def plot_multi_cka(
 
         y_all.extend(cka_vals)
 
-        ls = linestyles[i % len(linestyles)]
         mk = markers[i % len(markers)]
 
         if lambdas is not None:
-            label = r"$\lambda_{\mathrm{CKA}}=" + str(lambdas[i]) + r"$"
+            lam_str = str(lambdas[i])
+            label = r"$\lambda_{\mathrm{CKA}}=" + lam_str + r"$"
+            try:
+                lam_val = float(lam_str)
+            except ValueError:
+                lam_val = None
         else:
+            lam_str = None
+            lam_val = None
             label = Path(log_path).name
+
+        # 颜色选择：优先查映射，其次 fallback
+        color = None
+        if lam_val is not None:
+            for key, c in lambda_color_map.items():
+                if abs(lam_val - key) < 1e-6:
+                    color = c
+                    break
+        if color is None:
+            color = fallback_colors[i % len(fallback_colors)]
 
         ax.plot(
             epochs,
             cka_vals,
-            linestyle=ls,
+            linestyle="-",
             marker=mk,
             linewidth=2.0,
             markersize=4,
+            color=color,
             label=label,
         )
 
@@ -125,23 +143,29 @@ def plot_multi_cka(
     ax.set_ylabel("Validation Indep (CKA)")
     ax.grid(True, alpha=0.3)
 
-    # 固定图例位置在右上角，白底稍透明，避免挡住曲线
-    legend = ax.legend(
-        loc="upper right",
+    # 图例放在上方外侧一排
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(
+        handles,
+        labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=len(labels),
         frameon=True,
         framealpha=0.9,
         fancybox=True,
     )
 
-    # y 轴稍微留一点上下边距
+    # 为上方图例留一点空间
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.9])
+
+    # y 轴留一点上下边距
     ymin, ymax = min(y_all), max(y_all)
     margin = (ymax - ymin) * 0.05 if ymax > ymin else 0.02
     ax.set_ylim(ymin - margin, ymax + margin)
 
-    fig.tight_layout()
-
     out_path = Path.cwd() / out_name
-    fig.savefig(out_path, dpi=300)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     print(f"[INFO] 多 run 的 Validation CKA 曲线已保存到: {out_path}")

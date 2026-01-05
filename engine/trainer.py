@@ -334,6 +334,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
     target_ind_lambda = float(config['losses'].get('lambda_independence', 0.0))
 
     best_relative_score = -float('inf')
+    best_metrics_tgt = {}
 
     # [NEW] 记录源域最佳分数和指标
     best_score_src = -float('inf')
@@ -456,7 +457,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
                 if is_best:
                     best_relative_score = score
                     best_epoch = epoch + 1
-                    best_metrics_details = val_metrics.copy()
+                    best_metrics_tgt = val_metrics.copy()
                     logging.info(f"  -> 🏆 Best Model (vs Stage2-Start)! Score: {score:.2%}")
 
                 save_checkpoint({
@@ -519,6 +520,27 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
                     }, False, checkpoint_dir=checkpoint_dir, filename='model_best_gta5.pth.tar')
 
     logging.info(f"\n✅ Training Finished. Best Epoch: {best_epoch}, Score: {best_relative_score:.2%}")
+
+    if best_metrics_tgt:
+        final_tgt_miou = best_metrics_tgt.get('seg_miou', 0.0)
+        final_tgt_acc = best_metrics_tgt.get('seg_pixel_acc', 0.0)
+        final_tgt_depth_abs = best_metrics_tgt.get('depth_abs_err', 0.0)
+        final_tgt_depth_rel = best_metrics_tgt.get('depth_rel_err', 0.0)
+
+        logging.info("+" * 60)
+        logging.info(f"🏆 FINAL BEST RESULT (Target: {data_type.upper()}) @ Epoch {best_epoch}")
+        logging.info(
+            f"   Best Target Result -> mIoU: {final_tgt_miou:.4f} | Pixel Acc: {final_tgt_acc:.4f} | Depth Abs: {final_tgt_depth_abs:.4f} | Depth Rel: {final_tgt_depth_rel:.4f}")
+        if 'nyu' in data_type.lower():
+            final_normal_mean = best_metrics_tgt.get('normal_mean_angle', 0.0)
+            final_normal_median = best_metrics_tgt.get('normal_median_angle', 0.0)
+            final_normal_11 = best_metrics_tgt.get('normal_acc_11', 0.0)
+            final_normal_30 = best_metrics_tgt.get('normal_acc_30', 0.0)
+            logging.info(
+                f"   [Normal]      -> Mean: {final_normal_mean:.4f}° | Median: {final_normal_median:.4f}° | "
+                f"Acc 11°: {final_normal_11:.4f} | Acc 30°: {final_normal_30:.4f}"
+            )
+        logging.info("+" * 60)
 
     if val_loader_source is not None:
         # [Modified] 打印最优 GTA5 的完整指标：mIoU, Pixel Acc, Abs Err, Rel Err

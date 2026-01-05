@@ -1,0 +1,37 @@
+data:
+  name: 'nyuv2'
+  root_path: '../mtl_dataset/nyuv2'
+  batch_size: 8
+  num_workers: 4
+  img_size: [288, 384]
+
+model:
+  type: 'raw_mtl'
+  encoder_name: 'resnet50'
+  pretrained: True
+
+# 🔥 核心修复：把 optimization 改为 training，并补充必要参数
+training:
+  enable_training: true
+  optimizer: 'adam'
+  learning_rate: 0.0001   # trainer.py 读这个
+  lr: 0.0001              # run_ablation.py 备用
+  weight_decay: 0.0001
+  epochs: 100
+  seed: 2024
+
+  # 调度器参数
+  lr_scheduler:
+    type: "cosine"
+    warmup_epochs: 5
+    min_lr_factor: 0.01
+
+logging:
+  log_dir: './runs'
+
+losses:
+  tasks: ['seg', 'depth', 'normal']
+  loss_weights:
+    seg: 1.0
+    depth: 1.0
+    normal: 1.0

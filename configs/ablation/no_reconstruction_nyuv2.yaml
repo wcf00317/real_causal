@@ -42,7 +42,7 @@ training:
     min_lr_factor: 0.01
 
   cfa:
-    enabled: true
+    enabled: false
     start_epoch: 20
     cka_threshold: 0.1
     prob: 0.5
@@ -73,5 +73,5 @@ losses:
   # 因为不再重构图像，这些物理约束也应一并移除
   lambda_img: 0.0         # 原 2.0 -> 改为 0.0
   lambda_alb_tv: 0.0      # 原 0.1 -> 改为 0.0
-  lambda_sh_gray: 0.0     # 原 0.001 -> 改为 0.0 
+  lambda_sh_gray: 0.0     # 原 0.001 -> 改为 0.0
   lambda_xcov: 0.0        # 原 0.5 -> 改为 0.0
